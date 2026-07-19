@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -50,6 +52,74 @@ class ChunkingTests(unittest.TestCase):
             path.write_bytes(b"abc\x00def")
             with self.assertRaisesRegex(ValueError, "binary"):
                 chunker.read_text_file(path)
+
+    def test_manifest_path_escape_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.txt"
+            source.write_text("line\n" * 600, encoding="utf-8")
+            output = chunker.write_bundle(source, root / "bundle", max_chars=1_000, overlap_chars=50)
+            manifest_path = output / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["records"][0]["filename"] = "../outside.txt"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "simple relative filename"):
+                chunker.verify_bundle(output)
+
+    def test_malformed_manifest_returns_a_clean_cli_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.txt"
+            source.write_text("line\n" * 600, encoding="utf-8")
+            output = chunker.write_bundle(source, root / "bundle", max_chars=1_000, overlap_chars=50)
+            manifest_path = output / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["records"][0] = {}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                exit_code = chunker.main(["verify", str(output)])
+
+            self.assertEqual(exit_code, 2)
+            self.assertIn("ERROR: Record 1", captured.getvalue())
+            self.assertNotIn("Traceback", captured.getvalue())
+
+    def test_manifest_chunk_count_must_match_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.txt"
+            source.write_text("line\n" * 600, encoding="utf-8")
+            output = chunker.write_bundle(source, root / "bundle", max_chars=1_000, overlap_chars=50)
+            manifest_path = output / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunk_count"] += 1
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "chunk_count"):
+                chunker.verify_bundle(output)
+
+    def test_manifest_rejects_windows_filename_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.txt"
+            source.write_text("line\n" * 600, encoding="utf-8")
+            output = chunker.write_bundle(source, root / "bundle", max_chars=1_000, overlap_chars=50)
+            manifest_path = output / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            for filename in (
+                "chunk_001_of_003.txt:review",
+                "chunk_001_of_003.txt.",
+                "chunk_001_of_003.txt ",
+                "CON.txt",
+            ):
+                with self.subTest(filename=filename):
+                    manifest["records"][0]["filename"] = filename
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "filename"):
+                        chunker.verify_bundle(output)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 # Large Text Chunker
 
+[![Tests](https://github.com/Jnapier2/large-text-chunker/actions/workflows/test.yml/badge.svg)](https://github.com/Jnapier2/large-text-chunker/actions/workflows/test.yml)
+
 Large Text Chunker turns large text documents into ordered, overlap-aware, independently verifiable chunks. It keeps useful context at chunk boundaries while preserving enough metadata to reconstruct the normalized source exactly.
 
 ## What it demonstrates
@@ -47,10 +49,10 @@ python -m py_compile src/large_text_chunker.py
 
 - Input newlines are normalized to `LF`; the manifest stores both the original byte hash and the normalized-text hash.
 - The built-in token value is an estimate, not a model-specific billing count.
-- Binary and empty inputs are rejected.
+- Inputs containing NUL bytes and empty inputs are rejected.
 - Existing output folders are never overwritten; a numeric suffix is added instead.
 - Chunk contents inherit the sensitivity of the input document and should be handled accordingly.
 
 ## License
 
-Copyright 2026 Gateway Information Group LLC. Source is shared for portfolio review under the terms in [LICENSE.md](LICENSE.md).
+Copyright 2026 Gateway Information Group LLC. Use is governed by [LICENSE.md](LICENSE.md).

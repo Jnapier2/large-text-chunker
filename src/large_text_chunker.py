@@ -11,16 +11,27 @@ import bisect
 import hashlib
 import json
 import math
+import os
 import re
+import stat
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Iterable, Sequence
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Iterable, Sequence
 
 VERSION = "1.0.0"
 DEFAULT_MAX_CHARS = 12_000
 DEFAULT_OVERLAP_CHARS = 600
 MIN_MAX_CHARS = 1_000
+MANIFEST_SCHEMA = "large-text-chunker-manifest-v1"
+MAX_MANIFEST_BYTES = 2_000_000
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
+WINDOWS_RESERVED_BASENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CLOCK$"}
+    | {f"COM{number}" for number in range(1, 10)}
+    | {f"LPT{number}" for number in range(1, 10)}
+)
 
 
 @dataclass(frozen=True)
@@ -171,6 +182,73 @@ def atomic_write(path: Path, content: str) -> None:
     temporary.replace(path)
 
 
+def _required_int(
+    mapping: dict[str, Any],
+    field: str,
+    *,
+    label: str,
+    minimum: int = 0,
+) -> int:
+    value = mapping.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise ValueError(f"{label} {field} must be an integer of at least {minimum}")
+    return value
+
+
+def _required_sha256(mapping: dict[str, Any], field: str, *, label: str) -> str:
+    value = mapping.get(field)
+    if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{label} {field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _simple_chunk_filename(value: Any, *, record_number: int) -> str:
+    if not isinstance(value, str) or not value or len(value) > 255 or value in {".", ".."}:
+        raise ValueError(f"Record {record_number} filename must be a simple relative filename")
+    if any(
+        ord(character) < 32 or character in WINDOWS_FORBIDDEN_FILENAME_CHARACTERS
+        for character in value
+    ):
+        raise ValueError(
+            f"Record {record_number} filename must be a simple relative filename; "
+            "Windows-forbidden characters are not allowed"
+        )
+    if value.endswith((".", " ")):
+        raise ValueError(f"Record {record_number} filename may not end in a dot or space")
+    windows_basename = value.split(".", 1)[0].upper()
+    if windows_basename in WINDOWS_RESERVED_BASENAMES:
+        raise ValueError(f"Record {record_number} filename uses a reserved Windows device name")
+    for path_type in (PurePosixPath, PureWindowsPath):
+        parsed = path_type(value)
+        if parsed.is_absolute() or parsed.drive or len(parsed.parts) != 1:
+            raise ValueError(f"Record {record_number} filename must be a simple relative filename")
+    return value
+
+
+def _is_reparse_point(info: os.stat_result) -> bool:
+    attributes = getattr(info, "st_file_attributes", 0)
+    marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(marker and attributes & marker)
+
+
+def _checked_regular_file(bundle: Path, filename: str, *, label: str) -> Path:
+    candidate = bundle / filename
+    try:
+        info = os.lstat(candidate)
+    except OSError as exc:
+        raise ValueError(f"{label} is unavailable: {filename}") from exc
+    if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info):
+        raise ValueError(f"{label} may not be a link or reparse point: {filename}")
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{label} is not a regular file: {filename}")
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(bundle)
+    except ValueError as exc:
+        raise ValueError(f"{label} resolves outside the bundle: {filename}") from exc
+    return resolved
+
+
 def write_bundle(
     source: Path,
     output: Path | None = None,
@@ -216,7 +294,7 @@ def write_bundle(
         previous_raw = raw_chunk
 
     manifest = {
-        "schema": "large-text-chunker-manifest-v1",
+        "schema": MANIFEST_SCHEMA,
         "tool_version": VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_name": source.name,
@@ -256,23 +334,102 @@ def write_bundle(
 
 def verify_bundle(bundle: Path) -> str:
     bundle = bundle.resolve(strict=True)
-    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("schema") != "large-text-chunker-manifest-v1":
+    if not bundle.is_dir():
+        raise ValueError("Bundle path is not a directory")
+    manifest_path = _checked_regular_file(bundle, "manifest.json", label="Manifest")
+    if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
+        raise ValueError(f"Manifest exceeds the {MAX_MANIFEST_BYTES}-byte safety limit")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("Manifest root must be a JSON object")
+    if manifest.get("schema") != MANIFEST_SCHEMA:
         raise ValueError("Unsupported or missing manifest schema")
 
+    for field in ("tool_version", "created_utc", "source_name", "source_encoding"):
+        value = manifest.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"Manifest {field} must be a non-empty string")
+    if not isinstance(manifest.get("normalized_newlines"), bool):
+        raise ValueError("Manifest normalized_newlines must be a boolean")
+    _required_sha256(manifest, "source_bytes_sha256", label="Manifest")
+    normalized_text_sha256 = _required_sha256(manifest, "normalized_text_sha256", label="Manifest")
+    max_characters = _required_int(
+        manifest,
+        "max_characters_per_raw_chunk",
+        label="Manifest",
+        minimum=MIN_MAX_CHARS,
+    )
+    requested_overlap = _required_int(
+        manifest,
+        "requested_overlap_characters",
+        label="Manifest",
+    )
+    if requested_overlap >= max_characters:
+        raise ValueError("Manifest requested overlap must be smaller than the raw chunk limit")
+    chunk_count = _required_int(manifest, "chunk_count", label="Manifest", minimum=1)
+    records = manifest.get("records")
+    if not isinstance(records, list):
+        raise ValueError("Manifest records must be a JSON array")
+    if len(records) != chunk_count:
+        raise ValueError("Manifest chunk_count does not match the number of records")
+
     reconstructed: list[str] = []
-    for record in manifest.get("records", []):
-        content = (bundle / record["filename"]).read_text(encoding="utf-8")
-        if sha256_text(content) != record["output_sha256"]:
-            raise ValueError(f"Output hash mismatch: {record['filename']}")
-        prefix_length = int(record["overlap_prefix_characters"])
+    filenames: set[str] = set()
+    expected_raw_start = 0
+    for index, record_value in enumerate(records, start=1):
+        if not isinstance(record_value, dict):
+            raise ValueError(f"Record {index} must be a JSON object")
+        record: dict[str, Any] = record_value
+        number = _required_int(record, "number", label=f"Record {index}", minimum=1)
+        if number != index:
+            raise ValueError(f"Record {index} number must match its sequence position")
+        filename = _simple_chunk_filename(record.get("filename"), record_number=index)
+        filename_key = filename.casefold()
+        if filename_key in filenames:
+            raise ValueError(f"Record {index} repeats chunk filename: {filename}")
+        filenames.add(filename_key)
+
+        raw_start = _required_int(record, "raw_start", label=f"Record {index}")
+        raw_end = _required_int(record, "raw_end", label=f"Record {index}", minimum=1)
+        raw_characters = _required_int(record, "raw_characters", label=f"Record {index}", minimum=1)
+        prefix_length = _required_int(record, "overlap_prefix_characters", label=f"Record {index}")
+        output_characters = _required_int(record, "output_characters", label=f"Record {index}", minimum=1)
+        start_line = _required_int(record, "start_line", label=f"Record {index}", minimum=1)
+        end_line = _required_int(record, "end_line", label=f"Record {index}", minimum=1)
+        _required_int(record, "estimated_tokens", label=f"Record {index}", minimum=1)
+        output_sha256 = _required_sha256(record, "output_sha256", label=f"Record {index}")
+        raw_sha256 = _required_sha256(record, "raw_sha256", label=f"Record {index}")
+
+        if raw_start != expected_raw_start or raw_end <= raw_start:
+            raise ValueError(f"Record {index} raw offsets are not contiguous and increasing")
+        if raw_characters != raw_end - raw_start or raw_characters > max_characters:
+            raise ValueError(f"Record {index} raw character count is inconsistent")
+        if prefix_length > requested_overlap or output_characters != raw_characters + prefix_length:
+            raise ValueError(f"Record {index} overlap or output character count is inconsistent")
+        if index == 1 and prefix_length != 0:
+            raise ValueError("Record 1 may not declare an overlap prefix")
+        if end_line < start_line:
+            raise ValueError(f"Record {index} line range is invalid")
+
+        chunk_path = _checked_regular_file(bundle, filename, label=f"Record {index} chunk")
+        with chunk_path.open("r", encoding="utf-8", newline="") as handle:
+            content = handle.read()
+        if sha256_text(content) != output_sha256:
+            raise ValueError(f"Output hash mismatch: {filename}")
+        if len(content) != output_characters:
+            raise ValueError(f"Output character count mismatch: {filename}")
+        if prefix_length > len(content):
+            raise ValueError(f"Record {index} overlap prefix exceeds its chunk length")
         raw_content = content[prefix_length:]
-        if sha256_text(raw_content) != record["raw_sha256"]:
-            raise ValueError(f"Raw content hash mismatch: {record['filename']}")
+        if len(raw_content) != raw_characters:
+            raise ValueError(f"Raw character count mismatch: {filename}")
+        if sha256_text(raw_content) != raw_sha256:
+            raise ValueError(f"Raw content hash mismatch: {filename}")
         reconstructed.append(raw_content)
+        expected_raw_start = raw_end
 
     reconstructed_hash = sha256_text("".join(reconstructed))
-    if reconstructed_hash != manifest.get("normalized_text_sha256"):
+    if reconstructed_hash != normalized_text_sha256:
         raise ValueError("Reconstructed source hash does not match the manifest")
     return reconstructed_hash
 
@@ -308,7 +465,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             digest = verify_bundle(args.bundle)
             print(f"PASS: normalized source SHA-256 {digest}")
         return 0
-    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+    except (KeyError, OSError, OverflowError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}")
         return 2
 
