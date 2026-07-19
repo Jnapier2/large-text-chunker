@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/Jnapier2/large-text-chunker/actions/workflows/test.yml/badge.svg)](https://github.com/Jnapier2/large-text-chunker/actions/workflows/test.yml)
 
-Large Text Chunker turns large text documents into ordered, overlap-aware, independently verifiable chunks. It keeps useful context at chunk boundaries while preserving enough metadata to reconstruct the normalized source exactly.
+Large Text Chunker prepares documents for systems with input-size limits without giving up traceability. It splits text at readable boundaries, preserves configurable context, records integrity metadata, and verifies exact reconstruction of the normalized source.
 
 ## Design highlights
 
