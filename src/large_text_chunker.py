@@ -56,16 +56,17 @@ def read_text_file(path: Path) -> tuple[str, str, bytes]:
     raw = path.read_bytes()
     if b"\x00" in raw[:8192]:
         raise ValueError("Input appears to be binary; provide a text export instead.")
-    encodings = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
-    last_error: UnicodeDecodeError | None = None
-    for encoding in encodings:
+    for encoding in ("utf-8-sig", "cp1252"):
         try:
             text = raw.decode(encoding)
-            normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-            return normalized, encoding, raw
-        except UnicodeDecodeError as exc:
-            last_error = exc
-    raise ValueError(f"Unable to decode input as text: {last_error}")
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        encoding = "latin-1"
+        text = raw.decode(encoding)
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized, encoding, raw
 
 
 def split_long_unit(

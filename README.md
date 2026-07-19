@@ -1,8 +1,6 @@
 # Large Text Chunker
 
-**An offline utility for turning large text documents into ordered, overlap-aware, independently verifiable chunks.**
-
-Large Text Chunker is a compact public edition of an internal document-preparation workflow. It keeps useful context at chunk boundaries while preserving enough metadata to reconstruct the normalized source exactly.
+Large Text Chunker turns large text documents into ordered, overlap-aware, independently verifiable chunks. It keeps useful context at chunk boundaries while preserving enough metadata to reconstruct the normalized source exactly.
 
 ## What it demonstrates
 
@@ -52,10 +50,6 @@ python -m py_compile src/large_text_chunker.py
 - Binary and empty inputs are rejected.
 - Existing output folders are never overwritten; a numeric suffix is added instead.
 - Chunk contents inherit the sensitivity of the input document and should be handled accordingly.
-
-## Provenance
-
-This public edition preserves the core exact-splitting and verification ideas from the private ChatGPT Text Chunker v1.10.0 release while intentionally omitting Drive layouts, handoff prompts, internal asset registries, generated diagnostics, and platform-specific upload guidance.
 
 ## License
 
