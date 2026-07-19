@@ -4,6 +4,8 @@
 
 Large Text Chunker prepares documents for systems with input-size limits without giving up traceability. It splits text at readable boundaries, preserves configurable context, records integrity metadata, and verifies exact reconstruction of the normalized source.
 
+Its distinctive choice is to keep transport context separate from source content: overlap is added to each readable output, while raw boundaries remain available for integrity checks. Verification removes that overlap and proves the normalized source reconstructs exactly.
+
 ## Design highlights
 
 - Paragraph- and sentence-aware splitting with a hard size ceiling
@@ -24,7 +26,7 @@ Requires Python 3.10 or newer.
 python src/large_text_chunker.py split "notes.txt"
 ```
 
-Choose a different raw chunk size and overlap:
+Adjust the two workload controls without changing the integrity checks:
 
 ```powershell
 python src/large_text_chunker.py split "notes.txt" --max-chars 12000 --overlap 600
