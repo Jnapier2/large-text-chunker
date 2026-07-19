@@ -4,7 +4,7 @@
 
 Large Text Chunker turns large text documents into ordered, overlap-aware, independently verifiable chunks. It keeps useful context at chunk boundaries while preserving enough metadata to reconstruct the normalized source exactly.
 
-## What it demonstrates
+## Design highlights
 
 - Paragraph- and sentence-aware splitting with a hard size ceiling
 - Configurable context overlap without losing raw chunk boundaries
