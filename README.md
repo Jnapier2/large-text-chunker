@@ -4,7 +4,7 @@
 
 Large Text Chunker prepares documents for systems with input-size limits without giving up traceability. It splits text at readable boundaries, preserves configurable context, records integrity metadata, and verifies exact reconstruction of the normalized source.
 
-Its distinctive choice is to keep transport context separate from source content: overlap is added to each readable output, while raw boundaries remain available for integrity checks. Verification removes that overlap and proves the normalized source reconstructs exactly.
+Context overlap and source integrity are handled separately. Overlap keeps chunks readable for downstream tools; retained raw boundaries let verification remove that added context and reconstruct the normalized source exactly.
 
 ## Design highlights
 
