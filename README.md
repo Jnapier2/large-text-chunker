@@ -55,6 +55,8 @@ python -m py_compile src/large_text_chunker.py
 - Existing output folders are never overwritten; a numeric suffix is added instead.
 - Chunk contents inherit the sensitivity of the input document and should be handled accordingly.
 
-## License
+## Portfolio and license
 
-Copyright 2026 Gateway Information Group LLC. Use is governed by [LICENSE.md](LICENSE.md).
+[Portfolio](https://jerry-napier-portfolio.netlify.app/) · [GitHub profile](https://github.com/Jnapier2)
+
+Copyright © 2026 Gateway Information Group LLC. All rights reserved. Use is governed by [LICENSE.md](LICENSE.md).
