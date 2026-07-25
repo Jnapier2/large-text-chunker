@@ -6,6 +6,16 @@ Large Text Chunker prepares documents for systems with input-size limits without
 
 Context overlap and source integrity are handled separately. Overlap keeps chunks readable for downstream tools; retained raw boundaries let verification remove that added context and reconstruct the normalized source exactly.
 
+## Release lineage
+
+- **Current public source authority:** `1.0.0`.
+- **Newer recorded final:** `1.10.0`.
+- **Expected successor archive:** `ChatGPT_Text_Chunker_v1.10.0_20260718_0111_CDT.zip`.
+- **Recorded successor SHA-256:** `20a428ae390b0443ef08acc5bbcc562124f0f748be74be25b6d9e547916d8ebf`.
+- **Promotion status:** blocked because the checksum companion is retained but the exact ZIP is not currently retrievable.
+
+The repository is intentionally not relabeled as v1.10.0 while those source bytes are unavailable. Recovery and promotion are tracked in [issue #3](https://github.com/Jnapier2/large-text-chunker/issues/3).
+
 ## Design highlights
 
 - Paragraph- and sentence-aware splitting with a hard size ceiling
