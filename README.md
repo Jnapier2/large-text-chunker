@@ -10,7 +10,7 @@ Context overlap and source integrity are handled separately. Overlap keeps chunk
 
 - **Current public source authority:** `1.0.0`.
 - **Newer recorded final:** `1.10.0`.
-- **Expected successor archive:** `ChatGPT_Text_Chunker_v1.10.0_20260718_0111_CDT.zip`.
+- **Required promotion evidence:** the exact v1.10.0 successor source archive matching the recorded SHA-256.
 - **Recorded successor SHA-256:** `20a428ae390b0443ef08acc5bbcc562124f0f748be74be25b6d9e547916d8ebf`.
 - **Promotion status:** blocked because the checksum companion is retained but the exact ZIP is not currently retrievable.
 
