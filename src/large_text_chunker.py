@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Split large text files into ordered, verifiable context-sized chunks.
 
-Copyright 2026 Gateway Information Group LLC. All Rights Reserved.
+Copyright © 2026 Gateway Information Group LLC. All rights reserved.
 """
 
 from __future__ import annotations
@@ -19,9 +19,16 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
-VERSION = "1.0.0"
+VERSION = "1.10.0"
 DEFAULT_MAX_CHARS = 12_000
 DEFAULT_OVERLAP_CHARS = 600
+DEFAULT_TOKEN_COUNT_MODE = "estimate"
+DEFAULT_TOKENIZER_ENCODING = "o200k_base"
+OPTIONAL_TIKTOKEN_VERSION = "0.13.0"
+CHATGPT_UPLOAD_POLICY_REVIEWED_UTC = "2026-07-18T05:52:18Z"
+CHATGPT_UPLOAD_POLICY_FRESHNESS_DAYS = 30
+CHATGPT_FILE_SIZE_CAP_BYTES = 512 * 1024 * 1024
+CHATGPT_TEXT_TOKEN_CAP = 2_000_000
 MIN_MAX_CHARS = 1_000
 MANIFEST_SCHEMA = "large-text-chunker-manifest-v1"
 MAX_MANIFEST_BYTES = 2_000_000
@@ -48,6 +55,9 @@ class ChunkRecord:
     raw_sha256: str
     output_sha256: str
     estimated_tokens: int
+    token_count: int
+    token_count_method: str
+    tokenizer_encoding: str
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -61,6 +71,124 @@ def sha256_text(value: str) -> str:
 def estimated_tokens(value: str) -> int:
     """Return a deliberately conservative, dependency-free token estimate."""
     return math.ceil(len(value.encode("utf-8")) / 3)
+
+
+def _load_tiktoken_encoding(encoding_name: str) -> tuple[Any, str]:
+    """Load the optional tokenizer without installing packages or hiding failures."""
+    import tiktoken  # type: ignore[import-not-found]
+    from importlib.metadata import version as package_version
+
+    return tiktoken.get_encoding(encoding_name), package_version("tiktoken")
+
+
+class TokenCounter:
+    """Count tokens exactly when requested, with an explicit offline fallback."""
+
+    def __init__(self, requested_mode: str, encoding_name: str) -> None:
+        mode = str(requested_mode or DEFAULT_TOKEN_COUNT_MODE).strip().lower()
+        if mode not in {"auto", "exact", "estimate"}:
+            raise ValueError("token_count_mode must be one of: auto, exact, estimate")
+
+        encoding = str(encoding_name or DEFAULT_TOKENIZER_ENCODING).strip()
+        if not encoding or len(encoding) > 64 or re.fullmatch(r"[A-Za-z0-9_.-]+", encoding) is None:
+            raise ValueError(
+                "tokenizer_encoding must use letters, numbers, dots, dashes, or underscores"
+            )
+
+        self.requested_mode = mode
+        self.encoding_name = encoding
+        self.method = "estimated-utf8-bytes-div-3"
+        self.package_version: str | None = None
+        self.warning: str | None = None
+        self.fallback_reason: str | None = None
+        self._encoding: Any = None
+
+        if mode == "estimate":
+            return
+
+        try:
+            self._encoding, self.package_version = _load_tiktoken_encoding(encoding)
+            self.method = "tiktoken-exact"
+        except Exception as exc:
+            self.fallback_reason = type(exc).__name__
+            guidance = (
+                f"Optional tiktoken=={OPTIONAL_TIKTOKEN_VERSION} could not initialize "
+                f"the {encoding} encoding ({self.fallback_reason})."
+            )
+            if mode == "exact":
+                raise RuntimeError(
+                    f"{guidance} Install it explicitly with "
+                    f"'python -m pip install tiktoken=={OPTIONAL_TIKTOKEN_VERSION}' and retry."
+                ) from None
+            self.warning = f"{guidance} Using the conservative offline estimate instead."
+
+    @property
+    def exact(self) -> bool:
+        return self.method == "tiktoken-exact" and self._encoding is not None
+
+    def count(self, text: str) -> int:
+        if not text:
+            return 0
+        if self.exact:
+            return len(self._encoding.encode_ordinary(text))
+        return estimated_tokens(text)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "requested_mode": self.requested_mode,
+            "method": self.method,
+            "exact": self.exact,
+            "encoding": self.encoding_name,
+            "package": "tiktoken" if self.exact else None,
+            "package_version": self.package_version,
+            "recommended_optional_version": OPTIONAL_TIKTOKEN_VERSION,
+            "warning": self.warning,
+            "fallback_reason": self.fallback_reason,
+            "automatic_install": False,
+        }
+
+
+def chatgpt_upload_advisory(
+    source_size_bytes: int,
+    source_token_count: int,
+    counter: TokenCounter,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return a dated, nonblocking comparison with reviewed upload limits."""
+    reviewed = datetime.fromisoformat(CHATGPT_UPLOAD_POLICY_REVIEWED_UTC.replace("Z", "+00:00"))
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("Upload-advisory time must include a timezone")
+    age_days = max(0, (current.astimezone(timezone.utc) - reviewed).days)
+    status = "current" if age_days <= CHATGPT_UPLOAD_POLICY_FRESHNESS_DAYS else "review_due"
+    within_size = source_size_bytes <= CHATGPT_FILE_SIZE_CAP_BYTES
+    within_tokens = source_token_count <= CHATGPT_TEXT_TOKEN_CAP
+    if within_size and within_tokens:
+        assessment = "within_reviewed_caps" if counter.exact else "estimated_within_reviewed_caps"
+    else:
+        assessment = "exceeds_reviewed_cap" if counter.exact else "estimated_exceeds_reviewed_cap"
+
+    return {
+        "status": status,
+        "advisory_only": True,
+        "reviewed_utc": CHATGPT_UPLOAD_POLICY_REVIEWED_UTC,
+        "age_days": age_days,
+        "freshness_days": CHATGPT_UPLOAD_POLICY_FRESHNESS_DAYS,
+        "documented_file_size_cap_bytes": CHATGPT_FILE_SIZE_CAP_BYTES,
+        "documented_text_document_token_cap": CHATGPT_TEXT_TOKEN_CAP,
+        "source_size_bytes": source_size_bytes,
+        "source_token_count": source_token_count,
+        "token_count_method": counter.method,
+        "tokenizer_encoding": counter.encoding_name,
+        "within_size_cap": within_size,
+        "within_token_cap": within_tokens,
+        "assessment": assessment,
+        "note": (
+            "Reviewed upload caps do not guarantee plan eligibility, successful ingestion, "
+            "or that all content enters active model context."
+        ),
+    }
 
 
 def read_text_file(path: Path) -> tuple[str, str, bytes]:
@@ -202,6 +330,114 @@ def _required_sha256(mapping: dict[str, Any], field: str, *, label: str) -> str:
     return value
 
 
+def _required_text(mapping: dict[str, Any], field: str, *, label: str) -> str:
+    value = mapping.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} {field} must be a non-empty string")
+    return value
+
+
+def _validate_token_metadata(manifest: dict[str, Any]) -> tuple[str, str, int] | None:
+    """Validate additive v1.10 token metadata while retaining v1.0 bundle support."""
+    tokenizer_value = manifest.get("tokenizer")
+    if tokenizer_value is None:
+        return None
+    if not isinstance(tokenizer_value, dict):
+        raise ValueError("Manifest tokenizer must be a JSON object")
+    tokenizer: dict[str, Any] = tokenizer_value
+
+    requested_mode = _required_text(tokenizer, "requested_mode", label="Manifest tokenizer")
+    if requested_mode not in {"auto", "exact", "estimate"}:
+        raise ValueError("Manifest tokenizer requested_mode is unsupported")
+    method = _required_text(tokenizer, "method", label="Manifest tokenizer")
+    if method not in {"estimated-utf8-bytes-div-3", "tiktoken-exact"}:
+        raise ValueError("Manifest tokenizer method is unsupported")
+    encoding = _required_text(tokenizer, "encoding", label="Manifest tokenizer")
+    if len(encoding) > 64 or re.fullmatch(r"[A-Za-z0-9_.-]+", encoding) is None:
+        raise ValueError("Manifest tokenizer encoding is invalid")
+    exact = tokenizer.get("exact")
+    if not isinstance(exact, bool) or exact != (method == "tiktoken-exact"):
+        raise ValueError("Manifest tokenizer exact flag does not match its method")
+    if requested_mode == "exact" and not exact:
+        raise ValueError("Manifest exact token mode may not record an estimated fallback")
+    if tokenizer.get("automatic_install") is not False:
+        raise ValueError("Manifest tokenizer must explicitly disable automatic installation")
+    for field in ("package", "package_version", "warning", "fallback_reason"):
+        value = tokenizer.get(field)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"Manifest tokenizer {field} must be null or a non-empty string")
+    if exact and (
+        tokenizer.get("package") != "tiktoken"
+        or not isinstance(tokenizer.get("package_version"), str)
+    ):
+        raise ValueError("Manifest exact token mode must identify its tiktoken version")
+
+    source_size_bytes = _required_int(manifest, "source_size_bytes", label="Manifest", minimum=1)
+    source_token_count = _required_int(manifest, "source_token_count", label="Manifest", minimum=1)
+    advisory_value = manifest.get("chatgpt_upload_advisory")
+    if not isinstance(advisory_value, dict):
+        raise ValueError("Manifest chatgpt_upload_advisory must be a JSON object")
+    advisory: dict[str, Any] = advisory_value
+    if advisory.get("status") not in {"current", "review_due"}:
+        raise ValueError("Manifest upload advisory status is invalid")
+    if advisory.get("advisory_only") is not True:
+        raise ValueError("Manifest upload guidance must be advisory only")
+    reviewed_utc = _required_text(advisory, "reviewed_utc", label="Manifest upload advisory")
+    try:
+        reviewed = datetime.fromisoformat(reviewed_utc.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Manifest upload advisory reviewed_utc is invalid") from exc
+    if reviewed.tzinfo is None:
+        raise ValueError("Manifest upload advisory reviewed_utc must include a timezone")
+    age_days = _required_int(advisory, "age_days", label="Manifest upload advisory")
+    freshness_days = _required_int(
+        advisory, "freshness_days", label="Manifest upload advisory", minimum=1
+    )
+    expected_status = "current" if age_days <= freshness_days else "review_due"
+    if advisory.get("status") != expected_status:
+        raise ValueError("Manifest upload advisory status conflicts with its recorded age")
+    size_cap = _required_int(
+        advisory, "documented_file_size_cap_bytes", label="Manifest upload advisory", minimum=1
+    )
+    token_cap = _required_int(
+        advisory,
+        "documented_text_document_token_cap",
+        label="Manifest upload advisory",
+        minimum=1,
+    )
+    advisory_source_size = _required_int(
+        advisory, "source_size_bytes", label="Manifest upload advisory", minimum=1
+    )
+    if advisory_source_size != source_size_bytes:
+        raise ValueError("Manifest upload advisory source size conflicts with the manifest")
+    advisory_source_tokens = _required_int(
+        advisory, "source_token_count", label="Manifest upload advisory", minimum=1
+    )
+    if advisory_source_tokens != source_token_count:
+        raise ValueError("Manifest upload advisory token count conflicts with the manifest")
+    if _required_text(advisory, "token_count_method", label="Manifest upload advisory") != method:
+        raise ValueError("Manifest upload advisory token method conflicts with the tokenizer")
+    if _required_text(advisory, "tokenizer_encoding", label="Manifest upload advisory") != encoding:
+        raise ValueError("Manifest upload advisory encoding conflicts with the tokenizer")
+    for field, expected in (
+        ("within_size_cap", source_size_bytes <= size_cap),
+        ("within_token_cap", source_token_count <= token_cap),
+    ):
+        value = advisory.get(field)
+        if not isinstance(value, bool) or value != expected:
+            raise ValueError(f"Manifest upload advisory {field} is inconsistent")
+    expected_assessment = (
+        "within_reviewed_caps" if exact else "estimated_within_reviewed_caps"
+    )
+    if not (source_size_bytes <= size_cap and source_token_count <= token_cap):
+        expected_assessment = "exceeds_reviewed_cap" if exact else "estimated_exceeds_reviewed_cap"
+    assessment = _required_text(advisory, "assessment", label="Manifest upload advisory")
+    if assessment != expected_assessment:
+        raise ValueError("Manifest upload advisory assessment is inconsistent")
+    _required_text(advisory, "note", label="Manifest upload advisory")
+    return method, encoding, source_token_count
+
+
 def _simple_chunk_filename(value: Any, *, record_number: int) -> str:
     if not isinstance(value, str) or not value or len(value) > 255 or value in {".", ".."}:
         raise ValueError(f"Record {record_number} filename must be a simple relative filename")
@@ -255,6 +491,8 @@ def write_bundle(
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
     overlap_chars: int = DEFAULT_OVERLAP_CHARS,
+    token_count_mode: str = DEFAULT_TOKEN_COUNT_MODE,
+    tokenizer_encoding: str = DEFAULT_TOKENIZER_ENCODING,
 ) -> Path:
     if overlap_chars < 0:
         raise ValueError("overlap_chars cannot be negative")
@@ -264,6 +502,11 @@ def write_bundle(
     source = source.resolve(strict=True)
     text, encoding, raw_bytes = read_text_file(source)
     raw_chunks = build_chunks(text, max_chars)
+    token_counter = TokenCounter(token_count_mode, tokenizer_encoding)
+    source_token_count = token_counter.count(text)
+    upload_advisory = chatgpt_upload_advisory(
+        len(raw_bytes), source_token_count, token_counter
+    )
     base = output.resolve() if output else source.parent / f"{source.stem}_chunks"
     output_dir = unique_output_dir(base)
     newline_offsets = [match.start() for match in re.finditer("\n", text)]
@@ -289,6 +532,9 @@ def write_bundle(
                 raw_sha256=sha256_text(raw_chunk),
                 output_sha256=sha256_text(rendered),
                 estimated_tokens=estimated_tokens(rendered),
+                token_count=token_counter.count(rendered),
+                token_count_method=token_counter.method,
+                tokenizer_encoding=token_counter.encoding_name,
             )
         )
         previous_raw = raw_chunk
@@ -299,9 +545,13 @@ def write_bundle(
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_name": source.name,
         "source_encoding": encoding,
+        "source_size_bytes": len(raw_bytes),
         "source_bytes_sha256": sha256_bytes(raw_bytes),
         "normalized_text_sha256": sha256_text(text),
         "normalized_newlines": True,
+        "source_token_count": source_token_count,
+        "tokenizer": token_counter.snapshot(),
+        "chatgpt_upload_advisory": upload_advisory,
         "max_characters_per_raw_chunk": max_chars,
         "requested_overlap_characters": overlap_chars,
         "chunk_count": len(records),
@@ -315,18 +565,31 @@ def write_bundle(
         f"Source: `{source.name}`",
         f"Chunks: {len(records)}",
         f"Normalized text SHA-256: `{manifest['normalized_text_sha256']}`",
+        f"Token accounting: `{token_counter.method}` with `{token_counter.encoding_name}` "
+        f"({source_token_count} source tokens)",
+        f"Upload-cap advisory: `{upload_advisory['assessment']}`; policy review "
+        f"`{upload_advisory['status']}` as of `{upload_advisory['reviewed_utc']}`",
         "",
-        "Each file begins with the context overlap from the preceding raw chunk. The manifest records the exact prefix length so the normalized source can be reconstructed and verified.",
+        "Each file begins with the context overlap from the preceding raw chunk. "
+        "The manifest records the exact prefix length so the normalized source can be "
+        "reconstructed and verified.",
         "",
-        "| # | File | Source lines | Raw chars | Overlap | Estimated tokens |",
-        "|---:|---|---:|---:|---:|---:|",
+        "| # | File | Source lines | Raw chars | Overlap | Tokens | Method |",
+        "|---:|---|---:|---:|---:|---:|---|",
     ]
     for record in records:
         index.append(
             f"| {record.number} | `{record.filename}` | {record.start_line}-{record.end_line} | "
-            f"{record.raw_characters} | {record.overlap_prefix_characters} | {record.estimated_tokens} |"
+            f"{record.raw_characters} | {record.overlap_prefix_characters} | {record.token_count} | "
+            f"`{record.token_count_method}` |"
         )
-    index.extend(["", "Run `python src/large_text_chunker.py verify <bundle>` before sharing the bundle.", ""])
+    index.extend(
+        [
+            "",
+            "Run `python src/large_text_chunker.py verify <bundle>` before sharing the bundle.",
+            "",
+        ]
+    )
     atomic_write(output_dir / "index.md", "\n".join(index))
     verify_bundle(output_dir)
     return output_dir
@@ -353,6 +616,7 @@ def verify_bundle(bundle: Path) -> str:
         raise ValueError("Manifest normalized_newlines must be a boolean")
     _required_sha256(manifest, "source_bytes_sha256", label="Manifest")
     normalized_text_sha256 = _required_sha256(manifest, "normalized_text_sha256", label="Manifest")
+    token_metadata = _validate_token_metadata(manifest)
     max_characters = _required_int(
         manifest,
         "max_characters_per_raw_chunk",
@@ -396,7 +660,25 @@ def verify_bundle(bundle: Path) -> str:
         output_characters = _required_int(record, "output_characters", label=f"Record {index}", minimum=1)
         start_line = _required_int(record, "start_line", label=f"Record {index}", minimum=1)
         end_line = _required_int(record, "end_line", label=f"Record {index}", minimum=1)
-        _required_int(record, "estimated_tokens", label=f"Record {index}", minimum=1)
+        recorded_estimate = _required_int(
+            record, "estimated_tokens", label=f"Record {index}", minimum=1
+        )
+        record_token_count: int | None = None
+        if token_metadata is not None:
+            token_method, tokenizer_encoding, _ = token_metadata
+            record_token_count = _required_int(
+                record, "token_count", label=f"Record {index}", minimum=1
+            )
+            recorded_method = _required_text(
+                record, "token_count_method", label=f"Record {index}"
+            )
+            if recorded_method != token_method:
+                raise ValueError(f"Record {index} token method conflicts with the manifest")
+            recorded_encoding = _required_text(
+                record, "tokenizer_encoding", label=f"Record {index}"
+            )
+            if recorded_encoding != tokenizer_encoding:
+                raise ValueError(f"Record {index} tokenizer encoding conflicts with the manifest")
         output_sha256 = _required_sha256(record, "output_sha256", label=f"Record {index}")
         raw_sha256 = _required_sha256(record, "raw_sha256", label=f"Record {index}")
 
@@ -418,6 +700,15 @@ def verify_bundle(bundle: Path) -> str:
             raise ValueError(f"Output hash mismatch: {filename}")
         if len(content) != output_characters:
             raise ValueError(f"Output character count mismatch: {filename}")
+        calculated_estimate = estimated_tokens(content)
+        if recorded_estimate != calculated_estimate:
+            raise ValueError(f"Estimated token count mismatch: {filename}")
+        if (
+            token_metadata is not None
+            and token_metadata[0] == "estimated-utf8-bytes-div-3"
+            and record_token_count != calculated_estimate
+        ):
+            raise ValueError(f"Token count mismatch: {filename}")
         if prefix_length > len(content):
             raise ValueError(f"Record {index} overlap prefix exceeds its chunk length")
         raw_content = content[prefix_length:]
@@ -428,9 +719,16 @@ def verify_bundle(bundle: Path) -> str:
         reconstructed.append(raw_content)
         expected_raw_start = raw_end
 
-    reconstructed_hash = sha256_text("".join(reconstructed))
+    reconstructed_text = "".join(reconstructed)
+    reconstructed_hash = sha256_text(reconstructed_text)
     if reconstructed_hash != normalized_text_sha256:
         raise ValueError("Reconstructed source hash does not match the manifest")
+    if (
+        token_metadata is not None
+        and token_metadata[0] == "estimated-utf8-bytes-div-3"
+        and token_metadata[2] != estimated_tokens(reconstructed_text)
+    ):
+        raise ValueError("Manifest source token count does not match the reconstructed source")
     return reconstructed_hash
 
 
@@ -445,7 +743,20 @@ def build_parser() -> argparse.ArgumentParser:
     split_parser.add_argument("--output", type=Path)
     split_parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
     split_parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP_CHARS)
-    verify_parser = subparsers.add_parser("verify", help="Verify and reconstruct a bundle in memory")
+    split_parser.add_argument(
+        "--token-count-mode",
+        choices=("estimate", "exact", "auto"),
+        default=DEFAULT_TOKEN_COUNT_MODE,
+        help="Token reporting mode; auto falls back to the offline estimate",
+    )
+    split_parser.add_argument(
+        "--tokenizer-encoding",
+        default=DEFAULT_TOKENIZER_ENCODING,
+        help="Optional tiktoken encoding used by exact or auto mode",
+    )
+    verify_parser = subparsers.add_parser(
+        "verify", help="Verify and reconstruct a bundle in memory"
+    )
     verify_parser.add_argument("bundle", type=Path)
     return parser
 
@@ -459,13 +770,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.output,
                 max_chars=args.max_chars,
                 overlap_chars=args.overlap,
+                token_count_mode=args.token_count_mode,
+                tokenizer_encoding=args.tokenizer_encoding,
             )
             print(f"Created and verified: {destination}")
+            manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+            tokenizer = manifest["tokenizer"]
+            advisory = manifest["chatgpt_upload_advisory"]
+            print(
+                f"Token accounting: {tokenizer['method']} "
+                f"({manifest['source_token_count']} source tokens)"
+            )
+            if tokenizer.get("warning"):
+                print(f"WARNING: {tokenizer['warning']}")
+            print(
+                f"Upload-cap advisory: {advisory['assessment']} "
+                f"(policy review {advisory['status']})"
+            )
         else:
             digest = verify_bundle(args.bundle)
             print(f"PASS: normalized source SHA-256 {digest}")
         return 0
-    except (KeyError, OSError, OverflowError, TypeError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+    except (
+        KeyError,
+        OSError,
+        OverflowError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        json.JSONDecodeError,
+    ) as exc:
         print(f"ERROR: {exc}")
         return 2
 
