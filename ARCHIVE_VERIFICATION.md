@@ -1,6 +1,6 @@
 # Recovered v1.10.0 Archive Verification
 
-This record documents the exact Drive package recovered during the August 2, 2026 GitHub and Google Drive reconciliation. It verifies the package identity and describes the remaining source-promotion gate; it does not relabel the current GitHub tree.
+This record connects the current public source to the exact owner-controlled package recovered on August 2, 2026. The package remains immutable provenance; the repository keeps its compact, independently tested public layout.
 
 ## Recovered artifact
 
@@ -12,62 +12,46 @@ This record documents the exact Drive package recovered during the August 2, 202
 - Package file count: `10`
 - Original generated time: July 18, 2026 at 1:11:55 AM CDT
 
-The exact ZIP and its checksum companion were both recovered from the owner-controlled Google Drive registry. The calculated digest matches the retained checksum companion exactly.
+The calculated digest matches the retained checksum companion exactly.
 
-## Archive and manifest verification
+## Package verification
 
-The following checks passed:
+The recovered ZIP passed these read-only checks:
 
-- ZIP central-directory and CRC integrity;
+- central-directory and CRC integrity;
 - exactly ten expected regular-file entries;
-- no duplicate archive paths;
-- no absolute paths, parent traversal, symlinks, or device entries;
+- no duplicate, absolute, parent-traversal, symlink, or device paths;
 - canonical `MANIFEST.json` and `MANIFEST.csv` present;
-- every non-self manifest file size and SHA-256 record matches the packaged file;
-- the two manifest records use the documented `SELF_REFERENTIAL_SEE_ZIP_SHA256_SIDECAR` value rather than pretending a self-referential file hash can be fixed inside itself;
-- the package-level SHA-256 sidecar supplies the final immutable archive identity;
-- text review found no private-key blocks, credential values, or personal absolute user paths. References to `tiktoken` are dependency names, not authentication tokens.
+- every non-self manifest file size and SHA-256 record matched;
+- documented self-reference sentinels used for the two manifest records;
+- Python engine compilation, package preflight, built-in self-test, estimate-mode dry run, and normalized-text reconstruction; and
+- supported text scans found no private-key blocks, credential values, or personal absolute user paths.
 
-## Runtime verification
+## Public-source reconciliation
 
-Verification was performed from a clean extraction using Python 3.13.5:
+The public `1.10.0` source brings forward the package's safe, audience-relevant capabilities:
 
-- engine compilation: **PASS**;
-- package preflight: **PASS**;
-- built-in self-test: **PASS**;
-- estimate-mode dry run: **PASS**;
-- exact normalized-text reconstruction exercised by the self-test: **PASS**.
+- offline conservative token estimates;
+- optional exact `tiktoken` counting;
+- explicit `auto` fallback with a visible warning;
+- source and per-chunk token evidence; and
+- a dated, nonblocking upload-cap advisory.
 
-The package retains one BAT launcher, one Python engine, one default configuration source, project-relative paths, atomic writes, collision-safe output, bounded diagnostics, and source/chunk exclusion from Export20 support bundles.
+The reconciliation retained the repository's stronger filename and path validation, exact reconstruction verifier, atomic writes, collision-safe outputs, 1.0.0 manifest compatibility, public license, security policy, and Windows/Ubuntu CI. Package-specific transfer records, diagnostics utilities, configuration layers, and the separate BAT launcher remain outside the compact public tree.
 
 ## Dependency boundary
 
-The package requires only the Python standard library in its default `estimate` mode.
+The default `estimate` mode uses only the Python standard library and makes no network requests. Optional exact mode uses separately installed `tiktoken==0.13.0` with `o200k_base`; the tool never installs it. The tokenizer may retrieve its official encoding cache when first initialized. No API key or OpenAI API call is required.
 
-Optional exact token counting uses:
+No third-party code is bundled. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-- package: `tiktoken`
-- reviewed version: `0.13.0`
-- encoding: `o200k_base`
-- installation behavior: never installed automatically
-- network behavior: an official encoding-cache retrieval may be needed once when exact mode is first initialized
+## Artifact boundary
 
-The current public v1.0.0 source remains dependency-free. The optional v1.10.0 dependency does not become part of the public repository contract until the exact v1.10.0 source layout and CI are imported and reviewed.
+The recovered ZIP is not regenerated, attached to a GitHub release, or represented as an artifact built from this repository.
 
-## Remaining promotion gate
+The exact recovered files were copied byte-for-byte into a Windows path containing spaces on the ALPHA workstation. With Windows Security Center reporting the signed Norton 360 provider at state `0x041000` before and after the run, the BAT preflight and self-test passed, the self-test report recorded version `1.10.0` with status `PASS`, and all ten original source-file hashes remained unchanged. No antivirus exclusion or protection setting was changed.
 
-The earlier “archive unavailable” blocker is resolved. Promotion to public source still requires one controlled pass that:
-
-1. imports the exact recovered v1.10.0 files without reconstructing or silently redesigning them;
-2. reconciles the current `src/` and `tests/` layout with the package’s BAT, `tools/`, and `config/` layout;
-3. retains the repository’s current rights notice and documents the optional `tiktoken` license and notices;
-4. adds regression coverage for estimate, exact-unavailable, auto-fallback, reconstruction, manifest reconciliation, Windows-safe paths, and diagnostic export;
-5. runs the hosted Windows and Ubuntu CI matrix;
-6. validates the primary BAT launcher on Windows with spaces in the path;
-7. runs a Norton-on smoke test against the exact final release artifact; and
-8. updates the repository version, README, release ledger, dependency ledger, and downloadable package together only after every gate passes.
-
-Until that pass is complete, GitHub remains the public v1.0.0 source authority and the recovered v1.10.0 ZIP remains the checksum-verified successor package.
+Issue [#3](https://github.com/Jnapier2/large-text-chunker/issues/3) remains the review record until this source branch passes its hosted Windows and Ubuntu checks. The exact ZIP will remain immutable provenance rather than a recreated or attached GitHub artifact.
 
 Copyright © 2026 Gateway Information Group LLC. All rights reserved.
 
