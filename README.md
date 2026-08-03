@@ -10,7 +10,7 @@ Large Text Chunker turns oversized documents into readable, ordered bundles that
 - Exact normalized-text reconstruction, even when chunks include context overlap
 - SHA-256 evidence for the source, every raw segment, and every output file
 - Source-level and per-chunk token counts with three explicit modes
-- A dated, nonblocking comparison with reviewed ChatGPT upload caps
+- A dated, nonblocking comparison against documented upload limits
 - Privacy-conscious manifests that retain the source filename, not its local path
 - Atomic writes and collision-safe output folders
 
@@ -46,7 +46,7 @@ Each bundle contains numbered text files, `index.md`, and `manifest.json`.
 python src/large_text_chunker.py split "notes.txt" --token-count-mode estimate
 ```
 
-Optional exact counting uses OpenAI `tiktoken==0.13.0` with `o200k_base`. The tool never installs it automatically.
+Optional exact counting uses `tiktoken==0.13.0` with `o200k_base`. The tool never installs it automatically.
 
 ```powershell
 python -m pip install tiktoken==0.13.0
@@ -59,7 +59,7 @@ python src/large_text_chunker.py split "notes.txt" --token-count-mode exact
 python src/large_text_chunker.py split "notes.txt" --token-count-mode auto
 ```
 
-The first exact-mode run may allow `tiktoken` to retrieve its official encoding cache. No OpenAI account, API key, or API request is required.
+The first exact-mode run may allow `tiktoken` to retrieve its official encoding cache. Exact counting requires no account, API key, or API request.
 
 ## Evidence in every bundle
 
