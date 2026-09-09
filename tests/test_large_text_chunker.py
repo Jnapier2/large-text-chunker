@@ -1,3 +1,4 @@
+# Copyright © 2026 Gateway Information Group LLC. All rights reserved.
 from __future__ import annotations
 
 import contextlib
@@ -284,6 +285,153 @@ class ChunkingTests(unittest.TestCase):
                     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
                     with self.assertRaisesRegex(ValueError, "filename"):
                         chunker.verify_bundle(output)
+
+
+class InputEncodingTests(unittest.TestCase):
+    """Synthetic fixtures for the public encoding port; no private document data."""
+
+    TEXT = "Client café — 東京 😀\r\nSecond line.\rThird line.\n\n" * 60
+
+    def test_marked_utf_encodings_preserve_text_and_original_bytes(self) -> None:
+        import codecs
+        variants = (
+            (codecs.BOM_UTF8, "utf-8", "utf-8-sig"),
+            (codecs.BOM_UTF16_LE, "utf-16-le", "utf-16"),
+            (codecs.BOM_UTF16_BE, "utf-16-be", "utf-16"),
+            (codecs.BOM_UTF32_LE, "utf-32-le", "utf-32"),
+            (codecs.BOM_UTF32_BE, "utf-32-be", "utf-32"),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unicode.txt"
+            for bom, source_encoding, expected_encoding in variants:
+                with self.subTest(encoding=source_encoding):
+                    data = bom + self.TEXT.encode(source_encoding)
+                    path.write_bytes(data)
+                    text, detected, raw = chunker.read_text_file(path)
+                    self.assertEqual(text, self.TEXT.replace("\r\n", "\n").replace("\r", "\n"))
+                    self.assertEqual(detected, expected_encoding)
+                    self.assertEqual(raw, data)
+                    self.assertFalse(text.startswith("\ufeff"))
+
+    def test_unmarked_unicode_can_be_selected_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unicode.txt"
+            for encoding in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+                with self.subTest(encoding=encoding):
+                    path.write_bytes(self.TEXT.encode(encoding))
+                    text, detected, _ = chunker.read_text_file(path, encoding)
+                    self.assertEqual(detected, encoding)
+                    self.assertEqual(text, self.TEXT.replace("\r\n", "\n").replace("\r", "\n"))
+
+    def test_unmarked_nul_text_is_not_guessed_as_unicode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unmarked.txt"
+            path.write_bytes("plain text".encode("utf-16-le"))
+            with self.assertRaisesRegex(ValueError, "NUL"):
+                chunker.read_text_file(path)
+
+    def test_bom_and_explicit_encoding_must_agree(self) -> None:
+        import codecs
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "unicode.txt"
+            path.write_bytes(codecs.BOM_UTF16_BE + self.TEXT.encode("utf-16-be"))
+            for encoding in ("utf-8", "utf-16-le", "latin-1"):
+                with self.subTest(encoding=encoding):
+                    with self.assertRaisesRegex(ValueError, "conflicts"):
+                        chunker.read_text_file(path, encoding)
+            self.assertEqual(chunker.read_text_file(path, "utf-16-be")[1], "utf-16")
+
+    def test_malformed_marked_input_never_uses_legacy_fallback(self) -> None:
+        import codecs
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "invalid.txt"
+            for data in (codecs.BOM_UTF8 + b"\xff", codecs.BOM_UTF16_LE + b"a", codecs.BOM_UTF32_BE + b"abc"):
+                with self.subTest(data=data):
+                    path.write_bytes(data)
+                    with self.assertRaisesRegex(ValueError, "does not decode"):
+                        chunker.read_text_file(path)
+
+    def test_explicit_decode_error_is_not_lossy_or_content_leaking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "invalid.txt"
+            path.write_bytes(b"sensitive fixture \xff")
+            with self.assertRaises(ValueError) as raised:
+                chunker.read_text_file(path, "utf-8")
+            self.assertNotIn("sensitive fixture", str(raised.exception))
+            self.assertNotIn(str(path), str(raised.exception))
+            with self.assertRaisesRegex(ValueError, "Unsupported"):
+                chunker.read_text_file(path, "not-a-codec")
+
+    def test_nul_after_legacy_sample_boundary_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "late_nul.txt"
+            path.write_bytes(b"x" * 9000 + b"\x00")
+            with self.assertRaisesRegex(ValueError, "binary"):
+                chunker.read_text_file(path)
+
+    def test_unicode_nul_character_remains_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nul.txt"
+            path.write_bytes("ordinary\x00text".encode("utf-16"))
+            with self.assertRaisesRegex(ValueError, "NUL"):
+                chunker.read_text_file(path)
+
+    def test_legacy_single_byte_fallback_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.txt"
+            for text, encoding in (("café €", "cp1252"), ("café\x81", "latin-1")):
+                with self.subTest(encoding=encoding):
+                    path.write_bytes(text.encode(encoding))
+                    result, detected, _ = chunker.read_text_file(path)
+                    self.assertEqual(result, text)
+                    self.assertEqual(detected, encoding)
+
+    def test_marked_unicode_bundle_verifies_hashes_and_overlap(self) -> None:
+        import codecs
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "unicode.txt"
+            for bom, encoding in ((codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF32_BE, "utf-32-be")):
+                with self.subTest(encoding=encoding):
+                    original = bom + self.TEXT.encode(encoding)
+                    path.write_bytes(original)
+                    output = chunker.write_bundle(path, root / "bundle", max_chars=1000, overlap_chars=120)
+                    m = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+                    expected = self.TEXT.replace("\r\n", "\n").replace("\r", "\n")
+                    self.assertEqual(m["source_bytes_sha256"], chunker.sha256_bytes(original))
+                    self.assertEqual(m["source_size_bytes"], len(original))
+                    self.assertEqual(chunker.verify_bundle(output), chunker.sha256_text(expected))
+                    self.assertNotIn(str(root), json.dumps(m))
+                    self.assertGreater(m["chunk_count"], 1)
+
+    def test_rejected_encoding_creates_no_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "invalid.txt"
+            path.write_bytes(b"not utf-8: \xff")
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                code = chunker.main(["split", str(path), "--output", str(root / "bundle"), "--input-encoding", "utf-8"])
+            self.assertEqual(code, 2)
+            self.assertIn("ERROR:", log.getvalue())
+            self.assertFalse((root / "bundle").exists())
+
+    def test_cli_explicit_encoding_works_from_unrelated_cwd(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "unrelated"; cwd.mkdir()
+            path = root / "source export.txt"
+            path.write_bytes(self.TEXT.encode("utf-16-be"))
+            command = [sys.executable, str(ROOT / "src" / "large_text_chunker.py"), "split", str(path),
+                       "--input-encoding", "utf-16-be", "--max-chars", "1000"]
+            result = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            output = root / "source export_chunks"
+            self.assertTrue((output / "manifest.json").is_file())
+            self.assertEqual(list(cwd.iterdir()), [])
+            verify = subprocess.run([sys.executable, str(ROOT / "src" / "large_text_chunker.py"), "verify", str(output)],
+                                    cwd=cwd, text=True, capture_output=True, timeout=15)
+            self.assertEqual(verify.returncode, 0, verify.stderr + verify.stdout)
 
 
 if __name__ == "__main__":
