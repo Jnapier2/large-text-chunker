@@ -510,7 +510,7 @@ class DeepReviewRegressionTests(unittest.TestCase):
         original = path.read_text(encoding="utf-8")
         prefix = record["overlap_prefix_characters"]
         changed = "X" * prefix + original[prefix:]
-        path.write_text(changed, encoding="utf-8")
+        path.write_bytes(changed.encode("utf-8"))
         record["output_sha256"] = chunker.sha256_text(changed)
         self.save_manifest(out, manifest)
         with self.assertRaisesRegex(ValueError, "Overlap context"):
@@ -522,7 +522,7 @@ class DeepReviewRegressionTests(unittest.TestCase):
         path = out / record["filename"]
         original = path.read_text(encoding="utf-8")
         changed = original[record["overlap_prefix_characters"]:]
-        path.write_text(changed, encoding="utf-8")
+        path.write_bytes(changed.encode("utf-8"))
         record.update(overlap_prefix_characters=0, output_characters=len(changed),
                       output_sha256=chunker.sha256_text(changed),
                       estimated_tokens=chunker.estimated_tokens(changed),
