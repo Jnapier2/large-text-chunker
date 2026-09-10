@@ -29,8 +29,32 @@ jobs:
           python-version: "3.12"
       - name: Compile source
         run: python -m py_compile src/large_text_chunker.py
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
+      - name: Run tests and retain bounded diagnostics
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+          result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+                                  capture_output=True, text=True, timeout=180)
+          text = result.stdout + result.stderr
+          text = text.replace(str(Path.cwd()), "<workspace>").replace(tempfile.gettempdir(), "<temporary>")
+          if len(text) > 500000:
+              text = "LOG TRUNCATED TO FINAL 500000 CHARACTERS\n" + text[-500000:]
+          out = Path("test-artifacts")
+          out.mkdir(exist_ok=True)
+          (out / "tests.log").write_text(text, encoding="utf-8")
+          print(text)
+          raise SystemExit(result.returncode)
+      - name: Preserve test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: text-chunker-tests-${{ runner.os }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: test-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
 
   exact-token-smoke:
     timeout-minutes: 10
@@ -53,6 +77,7 @@ jobs:
 
   source-package:
     needs: [unit-tests, exact-token-smoke]
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -65,6 +90,8 @@ jobs:
           python-version: "3.12"
       - name: Package and test exact tracked source
         shell: python
+        env:
+          UPSTREAM_RESULTS: ${{ toJSON(needs) }}
         run: |
           import ast
           import hashlib
@@ -72,7 +99,6 @@ jobs:
           import os
           from pathlib import Path, PurePosixPath
           import re
-          import stat
           import subprocess
           import sys
           import tempfile
@@ -150,16 +176,19 @@ jobs:
           digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
           archive_path.with_suffix(".zip.sha256.txt").write_text(
               digest + "  " + archive_path.name + "\n", encoding="utf-8")
+          upstream = {key: value["result"] for key, value in json.loads(os.environ["UPSTREAM_RESULTS"]).items()}
           receipt = {
               "product": "Large Text Chunker", "version": version,
               "source_commit": head, "source_tree": tree,
               "archive": archive_path.name, "archive_sha256": digest,
               "file_count": len(payload), "zip_crc": "PASS",
+              "upstream_checks": upstream,
+              "qualification": "CI checks passed" if upstream and all(v == "success" for v in upstream.values()) else "UNQUALIFIED CANDIDATE; upstream checks did not all pass",
               "fresh_extraction_bytes": "PASS",
               "fresh_extraction_tests": {"ran": ran, "passed": ran - skipped_count,
                                          "skipped": skipped_count, "failed": 0},
               "method": "Tracked source only; no credentials, environment dump, or generated user data included.",
-              "limits": ["Not physical Windows or Norton acceptance", "Optional integration may skip here; separate CI jobs run it"],
+              "limits": ["Not physical Windows or Norton acceptance", "Optional integration may skip here; separate CI jobs run it", "Artifact availability is not release approval"],
               "files": [{"path": n, "git_blob": b, "bytes": len(d), "sha256": hashlib.sha256(d).hexdigest()}
                         for n, _, d, b in sorted(payload)],
               "copyright": "Copyright © 2026 Gateway Information Group LLC. All rights reserved."
