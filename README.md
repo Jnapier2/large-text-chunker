@@ -2,19 +2,19 @@
 
 [![Tests](https://github.com/Jnapier2/large-text-chunker/actions/workflows/test.yml/badge.svg)](https://github.com/Jnapier2/large-text-chunker/actions/workflows/test.yml)
 
-**Turn long documents into readable, ordered bundles without losing track of the source.**
+**Make long documents easier to share, review, and verify—without losing their context.**
 
-Large Text Chunker splits text at paragraph and sentence boundaries, carries optional context into the next chunk, and verifies that the pieces reconstruct the normalized document. Its manifests make a handoff reviewable: recipients can check the order, source ranges, content hashes, and token-accounting method rather than trust filenames alone.
+Large Text Chunker turns a text document into an ordered collection of readable segments. It favors paragraph and sentence boundaries, carries optional context into the next segment, and checks that the pieces reconstruct the normalized document. A reviewable index connects each segment to its source lines.
 
-## What is new in public source 1.11.0
+The distinctive design choice is to check the relationships between the pieces, not just their filenames: repeated context must match the preceding text, source ranges must agree with reconstructed content, and ambiguous manifest fields are rejected. An interrupted job is marked incomplete rather than presented as a finished handoff.
 
-Unicode exports no longer need to be converted manually just because their byte representation contains zeroes. The reader recognizes UTF-8, UTF-16, and UTF-32 byte-order marks, decodes strictly, and checks the entire decoded document for NUL characters. An explicit input-encoding option handles unmarked Unicode files without guessing their byte order.
+## Public source 1.11.1
 
-This is a selective encoding-capability adaptation from the newer 1.19.1 source lineage, not a publication of that entire private package. The public implementation, command path, output manifest, optional tokenizer pin, and existing verification controls remain independent.
+This update supports Unicode text exports with UTF-8, UTF-16, and UTF-32 byte-order marks, adds explicit encoding selection, and strengthens bundle verification and failure handling. The standard-library default runs locally without an account, credentials, or network requests.
 
 ## Quick start
 
-Requires Python 3.10 or newer. The default path is offline and uses only the Python standard library.
+Requires Python 3.10 or newer.
 
 ```powershell
 python src/large_text_chunker.py split "notes.txt"
@@ -22,24 +22,34 @@ python src/large_text_chunker.py split "notes.txt" --max-chars 12000 --overlap 6
 python src/large_text_chunker.py verify "notes_chunks"
 ```
 
-By default, the bundle is created beside the selected source file, not in the caller's working directory. `--output` selects another destination. Existing output folders are preserved using a numeric suffix. Each bundle contains numbered text files, `index.md`, and `manifest.json`.
+The default output is beside the selected source file, not in the caller's working directory. `--output` selects another destination. Existing outputs are preserved with a numeric suffix; output paths containing links or reparse points are rejected. Each finished bundle contains numbered text files, `index.md`, and `manifest.json`.
 
-## Input encodings
+`--max-chars` limits each raw segment. Optional overlap is additional context, so a rendered file may be larger by up to `--overlap` characters. A successful split prints `Created and verified`; a successful verification prints `PASS` with the normalized-text hash. Errors return exit code 2.
 
-Auto mode checks byte-order marks first, with UTF-32 checked before UTF-16. Unmarked inputs retain the previous UTF-8, Windows-1252, then Latin-1 fallback. Single-byte fallback cannot determine the intended language or encoding; review the resulting characters and select an encoding explicitly when known.
+## Read text accurately
+
+Auto mode recognizes byte-order marks before trying the previous UTF-8, Windows-1252, and Latin-1 fallback. Unmarked Unicode files require a known endian-specific encoding; the tool does not guess their byte order.
 
 ```powershell
 python src/large_text_chunker.py split "export.txt" --input-encoding utf-16-le
 python src/large_text_chunker.py split "export.txt" --input-encoding cp1252
 ```
 
-Supported choices are `auto`, `utf-8`, `utf-8-sig`, `utf-16`, `utf-16-le`, `utf-16-be`, `utf-32`, `utf-32-le`, `utf-32-be`, `cp1252`, and `latin-1`. Unmarked UTF-16/32 requires an explicit endian-specific choice. A marked file must agree with an explicit choice. Invalid marked/selected input fails before an output folder is created; it is not repaired with replacement characters or a legacy fallback.
+Supported choices: `auto`, `utf-8`, `utf-8-sig`, `utf-16`, `utf-16-le`, `utf-16-be`, `utf-32`, `utf-32-le`, `utf-32-be`, `cp1252`, and `latin-1`. Generic `utf-16` and `utf-32` require a byte-order mark. Conflicting selections, malformed marked/selected input, decoded NUL characters, and empty documents are rejected. Decoder errors do not include the document's contents.
 
-Newlines are normalized to LF. The manifest records the effective decoder, original byte count/hash, and normalized-text hash. Decoded NUL characters and empty documents are rejected. This is text validation, not a malware scanner or a general binary-file classifier.
+Newlines are normalized to LF. The original-byte hash and effective decoder are recorded separately from the normalized-text hash. Legacy single-byte fallback cannot establish the intended encoding; review the characters or select the known encoding explicitly.
 
-## Token accounting
+## Verify the handoff
 
-Input encoding and token-counting encoding are different settings. `estimate` remains the default and needs no package or network connection. Optional exact counting uses `tiktoken==0.13.0` with `o200k_base`; the tool never installs it automatically.
+Verification checks contiguous raw offsets, output and raw-segment hashes, exact repeated context, source line ranges, token-metadata consistency, and reconstruction of the normalized text. Duplicate JSON fields, non-finite values, oversized manifests, and unsafe chunk paths are rejected. It reads chunk content only up to the declared length plus a detection character, bounded further by the observed file size.
+
+New bundles use inclusive source-character line ranges: a newline belongs to the line it terminates. Supported older public bundles retain their recorded line-numbering convention. Original-byte hashes are recorded provenance; the original file is not reconstructed byte-for-byte after newline/encoding normalization. Exact-token counts are not recomputed by the offline verifier.
+
+An `.incomplete` marker means creation or verification did not finish. Keep the source and recreate the bundle; do not remove the marker merely to force a pass. Partial outputs are preserved rather than recursively deleted. Existing user files are not cleaned up automatically.
+
+## Optional token accounting
+
+`estimate` is the default: a UTF-8-byte heuristic, not a guaranteed upper bound. Input encoding and tokenizer encoding are separate settings. Optional exact counting uses separately installed `tiktoken==0.13.0` with `o200k_base`; nothing is installed automatically.
 
 ```powershell
 python -m pip install tiktoken==0.13.0
@@ -47,28 +57,20 @@ python src/large_text_chunker.py split "notes.txt" --token-count-mode exact
 python src/large_text_chunker.py split "notes.txt" --token-count-mode auto
 ```
 
-`auto` attempts exact counting and reports a fallback when the optional tokenizer cannot initialize. The first exact-mode run may retrieve the tokenizer's official encoding cache. No account, API key, or API request is required. Token counts describe the selected tokenizer, not guaranteed model comprehension or ingestion.
+`auto` reports a fallback when the optional tokenizer cannot initialize. Its first exact run may retrieve the official encoding cache. Token counts describe that tokenizer, not guaranteed ingestion or comprehension. The retained July 18, 2026 upload-cap comparison is a dated advisory that becomes `review_due` after 30 days; this update does not revalidate those external limits.
 
-## Evidence and compatibility
-
-Every bundle records original and normalized hashes, ordered raw offsets, source line ranges, overlap lengths, chunk hashes, and source/chunk token counts. Verification checks reconstruction and manifest consistency. Older supported manifests remain verifiable; the source input is not required to reconstruct normalized content from a complete bundle.
-
-The retained July 18, 2026 upload-cap comparison is a dated, nonblocking advisory. It becomes `review_due` after 30 days. This update does not refresh those external limits or guarantee upload eligibility, available context, or successful ingestion.
-
-## Verification and limits
+## Tests and practical boundaries
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-The suite covers reconstruction, overlap, path/filename rejection, token metadata, malformed manifests, Unicode byte orders, invalid decoding, late NUL characters, legacy inputs, and command-line operation from an unrelated directory. The existing workflow also runs Windows/Ubuntu checks and a separate real-tokenizer integration. Consult its exact commit-specific result; this page is not proof a pending workflow passed.
+Tests exercise Unicode and legacy inputs, byte-order conflicts, reconstruction, source ranges, overlap corruption, duplicate manifest fields, interrupted writes, output collisions, path rejection, and command-line use from unrelated directories. The existing workflow runs Windows/Ubuntu tests and a separate real-tokenizer check; use its exact commit-specific results as evidence.
 
-The splitter still reads documents into memory; streaming, private launchers, and private diagnostics from the newer package are not included in this selective port. Physical-device, Norton, and production acceptance are not claimed. Generated chunks inherit the sensitivity of their source; inspect them before sharing. Hash agreement checks integrity, not whether the content is safe to publish.
+This source edition reads documents and reconstructed text into memory; it is not a streaming processor or a hostile-writer filesystem sandbox. Physical-device, Norton, and production acceptance are not claimed. Generated chunks and filenames inherit the source's sensitivity: verification is an integrity check, not automatic sanitization or permission to publish. See [security guidance](SECURITY.md).
 
-## Lineage and rights
-
-Public source 1.11.0 builds on public 1.10.0 and selectively adapts input-decoding behavior from the 1.19.1 source lineage. It preserves one runtime module and the existing test suite rather than copying a second application. See [the changelog](CHANGELOG.md) and the retained [historical archive review](ARCHIVE_VERIFICATION.md).
+The public edition maintains one runtime module and stable commands. Its version and qualification are separate from other editions. [Changelog](CHANGELOG.md) · [Historical archive review](ARCHIVE_VERIFICATION.md)
 
 [Portfolio](https://jerry-napier-portfolio.netlify.app/) · [GitHub profile](https://github.com/Jnapier2)
 
-Copyright © 2026 Gateway Information Group LLC. All rights reserved. Use is governed by [LICENSE.md](LICENSE.md). No third-party code is bundled; optional components retain their own terms in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Copyright © 2026 Gateway Information Group LLC. All rights reserved. [LICENSE.md](LICENSE.md) governs use; public visibility does not grant an open-source license. Optional dependencies retain their terms in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
