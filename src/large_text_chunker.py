@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import codecs
 import hashlib
 import json
 import math
@@ -19,7 +20,12 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
-VERSION = "1.10.0"
+VERSION = "1.11.0"
+# Input decoding is separate from the optional token-counting encoding.
+INPUT_ENCODINGS = (
+    "auto", "utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
+    "utf-32", "utf-32-le", "utf-32-be", "cp1252", "latin-1",
+)
 DEFAULT_MAX_CHARS = 12_000
 DEFAULT_OVERLAP_CHARS = 600
 DEFAULT_TOKEN_COUNT_MODE = "estimate"
@@ -191,19 +197,51 @@ def chatgpt_upload_advisory(
     }
 
 
-def read_text_file(path: Path) -> tuple[str, str, bytes]:
+def read_text_file(
+    path: Path, input_encoding: str = "auto"
+) -> tuple[str, str, bytes]:
+    """Decode text once, honor byte-order marks, and reject decoded NULs.
+
+    Auto mode retains the public edition's UTF-8/legacy fallback for unmarked
+    files. Unmarked UTF-16/32 must be selected explicitly; no heuristic guesses
+    or replacement characters are used to make invalid input appear valid.
+    """
+    if input_encoding not in INPUT_ENCODINGS:
+        raise ValueError("Unsupported input encoding; use a documented encoding name.")
     raw = path.read_bytes()
-    if b"\x00" in raw[:8192]:
-        raise ValueError("Input appears to be binary; provide a text export instead.")
-    for encoding in ("utf-8-sig", "cp1252"):
-        try:
-            text = raw.decode(encoding)
+    # UTF-32 LE starts with the UTF-16 LE marker: longest markers go first.
+    markers = (
+        (codecs.BOM_UTF32_LE, "utf-32", {"utf-32", "utf-32-le"}),
+        (codecs.BOM_UTF32_BE, "utf-32", {"utf-32", "utf-32-be"}),
+        (codecs.BOM_UTF8, "utf-8-sig", {"utf-8", "utf-8-sig"}),
+        (codecs.BOM_UTF16_LE, "utf-16", {"utf-16", "utf-16-le"}),
+        (codecs.BOM_UTF16_BE, "utf-16", {"utf-16", "utf-16-be"}),
+    )
+    marked_encoding = None
+    for marker, encoding, compatible in markers:
+        if raw.startswith(marker):
+            if input_encoding != "auto" and input_encoding not in compatible:
+                raise ValueError("Selected input encoding conflicts with the byte-order mark.")
+            marked_encoding = encoding
             break
-        except UnicodeDecodeError:
-            continue
+    if marked_encoding is not None or input_encoding != "auto":
+        encoding = marked_encoding or input_encoding
+        try:
+            text = raw.decode(encoding, errors="strict")
+        except UnicodeError:
+            # Do not disclose input bytes or fall back after an explicit choice.
+            raise ValueError("Input does not decode using its selected or marked encoding.") from None
     else:
-        encoding = "latin-1"
-        text = raw.decode(encoding)
+        for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+            try:
+                text = raw.decode(encoding, errors="strict")
+                break
+            except UnicodeDecodeError:
+                continue
+    # Check the whole decoded document, not a raw byte prefix. Unicode byte
+    # encodings legitimately contain zero bytes, but a NUL character is rejected.
+    if "\x00" in text:
+        raise ValueError("Decoded input contains NUL characters and may be binary.")
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     return normalized, encoding, raw
 
@@ -493,6 +531,7 @@ def write_bundle(
     overlap_chars: int = DEFAULT_OVERLAP_CHARS,
     token_count_mode: str = DEFAULT_TOKEN_COUNT_MODE,
     tokenizer_encoding: str = DEFAULT_TOKENIZER_ENCODING,
+    input_encoding: str = "auto",
 ) -> Path:
     if overlap_chars < 0:
         raise ValueError("overlap_chars cannot be negative")
@@ -500,7 +539,7 @@ def write_bundle(
         raise ValueError("overlap_chars must be smaller than max_chars")
 
     source = source.resolve(strict=True)
-    text, encoding, raw_bytes = read_text_file(source)
+    text, encoding, raw_bytes = read_text_file(source, input_encoding)
     raw_chunks = build_chunks(text, max_chars)
     token_counter = TokenCounter(token_count_mode, tokenizer_encoding)
     source_token_count = token_counter.count(text)
@@ -741,6 +780,10 @@ def build_parser() -> argparse.ArgumentParser:
     split_parser = subparsers.add_parser("split", help="Create a new chunk bundle")
     split_parser.add_argument("source", type=Path)
     split_parser.add_argument("--output", type=Path)
+    split_parser.add_argument(
+        "--input-encoding", choices=INPUT_ENCODINGS, default="auto",
+        help="Text-file encoding; auto honors UTF byte-order marks before legacy fallback",
+    )
     split_parser.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS)
     split_parser.add_argument("--overlap", type=int, default=DEFAULT_OVERLAP_CHARS)
     split_parser.add_argument(
@@ -772,6 +815,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 overlap_chars=args.overlap,
                 token_count_mode=args.token_count_mode,
                 tokenizer_encoding=args.tokenizer_encoding,
+                input_encoding=args.input_encoding,
             )
             print(f"Created and verified: {destination}")
             manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
