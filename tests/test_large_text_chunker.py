@@ -434,5 +434,251 @@ class InputEncodingTests(unittest.TestCase):
             self.assertEqual(verify.returncode, 0, verify.stderr + verify.stdout)
 
 
+class DeepReviewRegressionTests(unittest.TestCase):
+    """Reproduced integrity and failure-boundary defects, not live user data."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source = self.root / "source.txt"
+        self.source.write_text("abcdef\n" * 800, encoding="utf-8")
+
+    def bundle(self) -> tuple[Path, dict]:
+        out = chunker.write_bundle(self.source, self.root / "bundle", max_chars=1000, overlap_chars=40)
+        return out, json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+
+    def save_manifest(self, out: Path, manifest: dict) -> None:
+        (out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_unmarked_generic_unicode_requires_explicit_byte_order(self) -> None:
+        for encoding in ("utf-16", "utf-32"):
+            with self.subTest(encoding=encoding):
+                self.source.write_bytes("ABC".encode(encoding + "-le"))
+                with self.assertRaisesRegex(ValueError, "explicit"):
+                    chunker.read_text_file(self.source, encoding)
+                with self.assertRaisesRegex(ValueError, "explicit"):
+                    chunker.write_bundle(self.source, self.root / "rejected", input_encoding=encoding)
+                self.assertFalse((self.root / "rejected").exists())
+
+    def test_newline_belongs_to_terminating_line(self) -> None:
+        offsets = [1, 3]
+        self.assertEqual([chunker.line_number_at(i, offsets) for i in range(5)], [1, 1, 2, 2, 3])
+
+    def test_new_bundle_ranges_match_actual_characters(self) -> None:
+        out, manifest = self.bundle()
+        self.assertEqual(manifest["line_numbering"], chunker.LINE_NUMBERING)
+        text, _, _ = chunker.read_text_file(self.source)
+        for record in manifest["records"]:
+            self.assertEqual(record["start_line"], 1 + text[:record["raw_start"]].count("\n"))
+            self.assertEqual(record["end_line"], 1 + text[:record["raw_end"] - 1].count("\n"))
+        self.assertEqual(chunker.verify_bundle(out), chunker.sha256_text(text))
+
+    def test_legacy_line_convention_remains_verifiable(self) -> None:
+        import bisect
+        out, manifest = self.bundle()
+        text, _, _ = chunker.read_text_file(self.source)
+        newlines = [i for i, char in enumerate(text) if char == "\n"]
+        manifest.pop("line_numbering")
+        for record in manifest["records"]:
+            record["start_line"] = bisect.bisect_right(newlines, record["raw_start"]) + 1
+            record["end_line"] = bisect.bisect_right(newlines, record["raw_end"] - 1) + 1
+        for version in ("1.0.0", "1.10.0", "1.11.0"):
+            with self.subTest(version=version):
+                manifest["tool_version"] = version
+                self.save_manifest(out, manifest)
+                self.assertEqual(chunker.verify_bundle(out), chunker.sha256_text(text))
+
+    def test_tampered_source_ranges_rejected(self) -> None:
+        out, manifest = self.bundle()
+        manifest["records"][0]["end_line"] += 100
+        self.save_manifest(out, manifest)
+        with self.assertRaisesRegex(ValueError, "line range"):
+            chunker.verify_bundle(out)
+
+    def test_missing_new_line_convention_rejected(self) -> None:
+        out, manifest = self.bundle()
+        manifest.pop("line_numbering")
+        self.save_manifest(out, manifest)
+        with self.assertRaisesRegex(ValueError, "line-numbering"):
+            chunker.verify_bundle(out)
+
+    def test_tampered_overlap_rejected_even_with_updated_hash(self) -> None:
+        out, manifest = self.bundle()
+        record = manifest["records"][1]
+        path = out / record["filename"]
+        original = path.read_text(encoding="utf-8")
+        prefix = record["overlap_prefix_characters"]
+        changed = "X" * prefix + original[prefix:]
+        path.write_text(changed, encoding="utf-8")
+        record["output_sha256"] = chunker.sha256_text(changed)
+        self.save_manifest(out, manifest)
+        with self.assertRaisesRegex(ValueError, "Overlap context"):
+            chunker.verify_bundle(out)
+
+    def test_missing_requested_overlap_rejected(self) -> None:
+        out, manifest = self.bundle()
+        record = manifest["records"][1]
+        path = out / record["filename"]
+        original = path.read_text(encoding="utf-8")
+        changed = original[record["overlap_prefix_characters"]:]
+        path.write_text(changed, encoding="utf-8")
+        record.update(overlap_prefix_characters=0, output_characters=len(changed),
+                      output_sha256=chunker.sha256_text(changed),
+                      estimated_tokens=chunker.estimated_tokens(changed),
+                      token_count=chunker.estimated_tokens(changed))
+        self.save_manifest(out, manifest)
+        with self.assertRaisesRegex(ValueError, "Overlap context"):
+            chunker.verify_bundle(out)
+
+    def test_duplicate_keys_rejected_at_root_and_nested_levels(self) -> None:
+        out, manifest = self.bundle()
+        original = json.dumps(manifest)
+        for key in ("chunk_count", "raw_start", "exact"):
+            with self.subTest(key=key):
+                mutated = original.replace(f'"{key}":', f'"{key}": null, "{key}":', 1)
+                (out / "manifest.json").write_text(mutated, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "duplicate JSON"):
+                    chunker.verify_bundle(out)
+
+    def test_nonfinite_json_rejected(self) -> None:
+        out, manifest = self.bundle()
+        for invalid in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(invalid=invalid):
+                text = json.dumps(manifest)[:-1] + ', "unused": ' + invalid + '}'
+                (out / "manifest.json").write_text(text, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "non-finite"):
+                    chunker.verify_bundle(out)
+
+    def test_excessive_json_nesting_returns_clean_cli_error(self) -> None:
+        out = self.root / "nested"; out.mkdir()
+        (out / "manifest.json").write_text("[" * 1500 + "0" + "]" * 1500, encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = chunker.main(["verify", str(out)])
+        self.assertEqual(code, 2)
+        self.assertNotIn("Traceback", output.getvalue())
+
+    def test_manifest_size_limit_is_enforced_on_actual_read(self) -> None:
+        out, _ = self.bundle()
+        (out / "manifest.json").write_bytes(b" " * (chunker.MAX_MANIFEST_BYTES + 1))
+        with self.assertRaisesRegex(ValueError, "safety limit"):
+            chunker.verify_bundle(out)
+
+    def test_current_token_metadata_cannot_be_silently_removed(self) -> None:
+        out, manifest = self.bundle()
+        manifest.pop("tokenizer")
+        self.save_manifest(out, manifest)
+        with self.assertRaisesRegex(ValueError, "tokenizer metadata"):
+            chunker.verify_bundle(out)
+
+    def test_estimate_mode_cannot_claim_exact_token_accounting(self) -> None:
+        out, manifest = self.bundle()
+        manifest["tokenizer"].update(method="tiktoken-exact", exact=True)
+        self.save_manifest(out, manifest)
+        with self.assertRaisesRegex(ValueError, "estimate mode"):
+            chunker.verify_bundle(out)
+
+    def test_failed_write_retains_incomplete_marker_and_source(self) -> None:
+        original = self.source.read_bytes()
+        real_write = chunker.atomic_write
+        def fail_on_chunk(path: Path, content: str) -> None:
+            if path.name.startswith("chunk_"):
+                raise OSError("fixture disk failure")
+            real_write(path, content)
+        with mock.patch.object(chunker, "atomic_write", side_effect=fail_on_chunk):
+            with self.assertRaises(OSError):
+                chunker.write_bundle(self.source, self.root / "failed")
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertTrue((self.root / "failed" / chunker.INCOMPLETE_MARKER).is_file())
+        with self.assertRaisesRegex(ValueError, "Incomplete"):
+            chunker.verify_bundle(self.root / "failed")
+
+    def test_failed_verification_does_not_mark_bundle_complete(self) -> None:
+        with mock.patch.object(chunker, "_verify_bundle_contents", side_effect=ValueError("fixture failure")):
+            with self.assertRaises(ValueError):
+                chunker.write_bundle(self.source, self.root / "failed")
+        with self.assertRaisesRegex(ValueError, "Incomplete"):
+            chunker.verify_bundle(self.root / "failed")
+
+    def test_success_clears_only_its_incomplete_marker(self) -> None:
+        out, _ = self.bundle()
+        self.assertFalse((out / chunker.INCOMPLETE_MARKER).exists())
+        self.assertEqual(list(out.glob(".chunker-*.tmp")), [])
+        chunker.verify_bundle(out)
+
+    def test_atomic_write_failure_preserves_target_and_removes_own_temp(self) -> None:
+        target = self.root / "target.txt"; target.write_text("preserve", encoding="utf-8")
+        with mock.patch.object(Path, "replace", side_effect=OSError("fixture replace failure")):
+            with self.assertRaises(OSError):
+                chunker.atomic_write(target, "replacement")
+        self.assertEqual(target.read_text(encoding="utf-8"), "preserve")
+        self.assertEqual(list(self.root.glob(".chunker-*.tmp")), [])
+
+    def test_predictable_legacy_temp_file_is_not_touched(self) -> None:
+        sentinel = self.root / ".target.txt.tmp"
+        sentinel.write_text("user data", encoding="utf-8")
+        chunker.atomic_write(self.root / "target.txt", "new")
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "user data")
+
+    def test_concurrent_output_collision_uses_next_exclusive_slot(self) -> None:
+        original = Path.mkdir
+        base = self.root / "bundle"
+        raced = False
+        def mkdir(path: Path, *args, **kwargs):
+            nonlocal raced
+            if path == base and not raced:
+                raced = True
+                original(path)
+                (path / "user.txt").write_text("preserve", encoding="utf-8")
+                raise FileExistsError("fixture concurrent creation")
+            return original(path, *args, **kwargs)
+        with mock.patch.object(Path, "mkdir", new=mkdir):
+            output = chunker.unique_output_dir(base)
+        self.assertEqual(output.name, "bundle_2")
+        self.assertEqual((base / "user.txt").read_text(encoding="utf-8"), "preserve")
+
+    def test_output_collision_retry_has_a_limit(self) -> None:
+        with mock.patch.object(chunker, "MAX_OUTPUT_COLLISIONS", 3):
+            with mock.patch.object(Path, "mkdir", side_effect=FileExistsError("fixture")) as calls:
+                with self.assertRaisesRegex(ValueError, "collision limit"):
+                    chunker.unique_output_dir(self.root / "blocked")
+            self.assertEqual(calls.call_count, 3)
+
+    def test_linked_output_parent_is_rejected_without_writing(self) -> None:
+        target = self.root / "external"; target.mkdir()
+        link = self.root / "link"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("OS does not allow creating symbolic links in this test environment")
+        with self.assertRaisesRegex(ValueError, "links or reparse"):
+            chunker.write_bundle(self.source, link / "bundle")
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_reparse_output_parent_is_rejected(self) -> None:
+        parent = self.root / "linked"; parent.mkdir()
+        with mock.patch.object(chunker, "_is_reparse_point", return_value=True):
+            with self.assertRaisesRegex(ValueError, "reparse"):
+                chunker.unique_output_dir(parent / "bundle")
+        self.assertEqual(list(parent.iterdir()), [])
+
+    def test_nonregular_input_rejected_before_reading(self) -> None:
+        with mock.patch.object(Path, "read_bytes") as read:
+            with self.assertRaisesRegex(ValueError, "regular"):
+                chunker.read_text_file(self.root)
+        read.assert_not_called()
+
+    def test_seeded_unicode_round_trips_preserve_text(self) -> None:
+        import random
+        randomizer = random.Random(14711)
+        for case in range(30):
+            text = "".join(randomizer.choices("abcXYZ .!?\n\ré東京😀", k=3000 + case * 21))
+            self.source.write_bytes(text.encode("utf-16" if case % 2 else "utf-8"))
+            out = chunker.write_bundle(self.source, self.root / "random", max_chars=1000,
+                                       overlap_chars=randomizer.choice([0, 1, 40, 999]))
+            normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+            self.assertEqual(chunker.verify_bundle(out), chunker.sha256_text(normalized))
+
+
 if __name__ == "__main__":
     unittest.main()

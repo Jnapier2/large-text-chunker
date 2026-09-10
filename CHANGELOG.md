@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.11.1 — 2026-09-09
+
+- Require a byte-order mark for generic UTF-16/32 instead of silently using native byte order. Endian-specific selections remain supported.
+- Verify actual overlap text and source line ranges; new bundles use inclusive character-based lines and old public bundles keep their legacy convention.
+- Reject duplicate JSON fields, non-finite values, excessive nesting, missing current token metadata, and contradictory estimate/exact claims. Bound manifest reads and limit chunk reads to declared/observed size.
+- Mark interrupted or failed bundles incomplete. Verification refuses them; partial evidence and original source files remain intact.
+- Use exclusive random same-directory temporary files with failure cleanup, bounded collision retries, and rejection of linked output destinations. Reject nonregular inputs before reading.
+- Add 25 regression methods to the existing test suite, including seeded Unicode round trips and injected write/verification failures.
+- Retain one runtime module, the established CLI and output placement, the existing optional dependency pin and workflows, and all existing license/history files. No full-package, runtime-diagnostics, physical-device, or Norton qualification is inherited.
+
+Version 1.11.0 was published through PR #10 while this deep review was in progress. This follow-up preserves that merge and applies the independently tested repairs; no public history is rewritten.
+
 ## 1.11.0 — 2026-09-09
 
 - Selectively adapted BOM-aware UTF-8/16/32 input decoding from the 1.19.1 source lineage into the existing compact public runtime.
