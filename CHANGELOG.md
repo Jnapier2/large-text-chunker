@@ -2,6 +2,8 @@
 
 ## 1.11.1 — 2026-09-09
 
+- Pending reconciliation: reuse byte-exact overlap fixtures across platforms and reject overflow-produced non-finite JSON numbers, including nested extension values. Finite extension numbers remain compatible.
+
 - Require a byte-order mark for generic UTF-16/32 instead of silently using native byte order. Endian-specific selections remain supported.
 - Verify actual overlap text and source line ranges; new bundles use inclusive character-based lines and old public bundles keep their legacy convention.
 - Reject duplicate JSON fields, non-finite values, excessive nesting, missing current token metadata, and contradictory estimate/exact claims. Bound manifest reads and limit chunk reads to declared/observed size.

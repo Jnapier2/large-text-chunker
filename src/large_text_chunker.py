@@ -391,6 +391,14 @@ def _reject_json_constant(value: str) -> Any:
     raise ValueError("Manifest contains a non-finite JSON value")
 
 
+def _finite_json_float(value: str) -> float:
+    """Reject overflowed numeric literals as well as named JSON constants."""
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError("Manifest contains a non-finite JSON value")
+    return result
+
+
 def _required_int(
     mapping: dict[str, Any],
     field: str,
@@ -708,6 +716,7 @@ def _verify_bundle_contents(bundle: Path) -> str:
             manifest_bytes.decode("utf-8"),
             object_pairs_hook=_unique_json_object,
             parse_constant=_reject_json_constant,
+            parse_float=_finite_json_float,
         )
     except (UnicodeError, RecursionError, json.JSONDecodeError):
         raise ValueError("Manifest is not a supported UTF-8 JSON document") from None

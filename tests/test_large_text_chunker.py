@@ -510,7 +510,7 @@ class DeepReviewRegressionTests(unittest.TestCase):
         original = path.read_text(encoding="utf-8")
         prefix = record["overlap_prefix_characters"]
         changed = "X" * prefix + original[prefix:]
-        path.write_text(changed, encoding="utf-8")
+        path.write_bytes(changed.encode("utf-8"))
         record["output_sha256"] = chunker.sha256_text(changed)
         self.save_manifest(out, manifest)
         with self.assertRaisesRegex(ValueError, "Overlap context"):
@@ -522,7 +522,7 @@ class DeepReviewRegressionTests(unittest.TestCase):
         path = out / record["filename"]
         original = path.read_text(encoding="utf-8")
         changed = original[record["overlap_prefix_characters"]:]
-        path.write_text(changed, encoding="utf-8")
+        path.write_bytes(changed.encode("utf-8"))
         record.update(overlap_prefix_characters=0, output_characters=len(changed),
                       output_sha256=chunker.sha256_text(changed),
                       estimated_tokens=chunker.estimated_tokens(changed),
@@ -549,6 +549,32 @@ class DeepReviewRegressionTests(unittest.TestCase):
                 (out / "manifest.json").write_text(text, encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "non-finite"):
                     chunker.verify_bundle(out)
+
+    def test_overflow_json_numbers_rejected_at_every_depth(self) -> None:
+        out, manifest = self.bundle()
+        original = json.dumps(manifest)
+        for literal in ("1e400", "-1e400", "1e9999", "-1e9999", "1.0e+9999", "-1.0e+9999"):
+            for value in (literal, '{"value":' + literal + '}', '[' + literal + ']'):
+                with self.subTest(value=value):
+                    changed = original[:-1] + ', "unused": ' + value + '}'
+                    (out / "manifest.json").write_bytes(changed.encode("utf-8"))
+                    with self.assertRaisesRegex(ValueError, "non-finite"):
+                        chunker.verify_bundle(out)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            code = chunker.main(["verify", str(out)])
+        self.assertEqual(code, 2)
+        self.assertIn("non-finite", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+
+    def test_finite_json_extension_numbers_remain_compatible(self) -> None:
+        out, manifest = self.bundle()
+        original = json.dumps(manifest)
+        expected = manifest["normalized_text_sha256"]
+        for literal in ("0.0", "-0.0", "1.5", "-1.5", "1e308", "-1e308", "1e-9999"):
+            with self.subTest(literal=literal):
+                changed = original[:-1] + ', "unused": {"value": [' + literal + ']}}'
+                (out / "manifest.json").write_bytes(changed.encode("utf-8"))
+                self.assertEqual(chunker.verify_bundle(out), expected)
 
     def test_excessive_json_nesting_returns_clean_cli_error(self) -> None:
         out = self.root / "nested"; out.mkdir()

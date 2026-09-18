@@ -49,7 +49,7 @@ No third-party code is bundled. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES
 
 The recovered ZIP is not regenerated, attached to a GitHub release, or represented as an artifact built from this repository.
 
-The exact recovered files were copied byte-for-byte into a Windows path containing spaces on the ALPHA workstation. With Windows Security Center reporting the signed Norton 360 provider at state `0x041000` before and after the run, the BAT preflight and self-test passed, the self-test report recorded version `1.10.0` with status `PASS`, and all ten original source-file hashes remained unchanged. No antivirus exclusion or protection setting was changed.
+The exact recovered files were copied byte-for-byte into a Windows path containing spaces on a Windows workstation. With Windows Security Center reporting the signed Norton 360 provider at state `0x041000` before and after the run, the BAT preflight and self-test passed, the self-test report recorded version `1.10.0` with status `PASS`, and all ten original source-file hashes remained unchanged. No antivirus exclusion or protection setting was changed.
 
 Issue [#3](https://github.com/Jnapier2/large-text-chunker/issues/3) remains the review record until this source branch passes its hosted Windows and Ubuntu checks. The exact ZIP will remain immutable provenance rather than a recreated or attached GitHub artifact.
 
