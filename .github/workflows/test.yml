@@ -29,8 +29,32 @@ jobs:
           python-version: "3.12"
       - name: Compile source
         run: python -m py_compile src/large_text_chunker.py
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
+      - name: Run tests and retain bounded diagnostics
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+          result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+                                  capture_output=True, text=True, timeout=180)
+          text = result.stdout + result.stderr
+          text = text.replace(str(Path.cwd()), "<workspace>").replace(tempfile.gettempdir(), "<temporary>")
+          if len(text) > 500000:
+              text = "LOG TRUNCATED TO FINAL 500000 CHARACTERS\n" + text[-500000:]
+          out = Path("test-artifacts")
+          out.mkdir(exist_ok=True)
+          (out / "tests.log").write_text(text, encoding="utf-8")
+          print(text)
+          raise SystemExit(result.returncode)
+      - name: Preserve test diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: text-chunker-tests-${{ runner.os }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: test-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
 
   exact-token-smoke:
     timeout-minutes: 10
@@ -50,5 +74,134 @@ jobs:
         run: python -m pip install --disable-pip-version-check "tiktoken==0.13.0"
       - name: Verify real exact-token round trip
         run: python -m unittest discover -s tests -p "test_exact_tiktoken_integration.py" -v
+
+  source-package:
+    needs: [unit-tests, exact-token-smoke]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Package and test exact tracked source
+        shell: python
+        env:
+          UPSTREAM_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          import ast
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import zipfile
+
+          root = Path.cwd()
+          def git(*args):
+              return subprocess.check_output(["git", *args], cwd=root)
+          head = git("rev-parse", "HEAD").decode().strip()
+          tree = git("rev-parse", "HEAD^{tree}").decode().strip()
+          entries = git("ls-files", "--stage", "-z").split(b"\0")
+          payload = []
+          seen = set()
+          for entry in filter(None, entries):
+              header, raw_name = entry.split(b"\t", 1)
+              mode, expected_blob, stage = header.decode("ascii").split()
+              name = raw_name.decode("utf-8")
+              rel = PurePosixPath(name)
+              if (mode not in {"100644", "100755"} or stage != "0"
+                  or rel.is_absolute() or ".." in rel.parts or "\\" in name
+                  or ":" in name or name.casefold() in seen):
+                  raise RuntimeError("Unsupported tracked source path or mode")
+              seen.add(name.casefold())
+              path = root / name
+              if path.is_symlink() or not path.is_file():
+                  raise RuntimeError("Tracked source must be a regular file")
+              data = path.read_bytes()
+              blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+              if blob != expected_blob:
+                  raise RuntimeError("Working bytes differ from the checked-out source")
+              if name.endswith(".py"):
+                  compile(data, name, "exec")
+              payload.append((name, mode, data, blob))
+          source = ast.parse((root / "src/large_text_chunker.py").read_text(encoding="utf-8"))
+          versions = [ast.literal_eval(node.value) for node in source.body
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(t, ast.Name) and t.id == "VERSION" for t in node.targets)]
+          if len(versions) != 1 or re.fullmatch(r"\d+\.\d+\.\d+", versions[0]) is None:
+              raise RuntimeError("Source version must be unambiguous")
+          version = versions[0]
+          artifacts = root / "artifacts"
+          artifacts.mkdir(exist_ok=True)
+          archive_path = artifacts / f"Large_Text_Chunker_{version}_Source.zip"
+          with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for name, mode, data, _ in sorted(payload):
+                  item = zipfile.ZipInfo("large-text-chunker/" + name, (2026, 9, 9, 0, 0, 0))
+                  item.compress_type = zipfile.ZIP_DEFLATED
+                  item.external_attr = int(mode, 8) << 16
+                  archive.writestr(item, data)
+          with tempfile.TemporaryDirectory(prefix=".source-check-", dir=root) as tmp:
+              extracted = Path(tmp)
+              with zipfile.ZipFile(archive_path) as archive:
+                  if archive.testzip() is not None:
+                      raise RuntimeError("Source ZIP failed CRC verification")
+                  archive.extractall(extracted)
+              app = extracted / "large-text-chunker"
+              for name, _, data, _ in payload:
+                  if (app / name).read_bytes() != data:
+                      raise RuntimeError("Fresh extraction changed source bytes")
+              temp_root = extracted / "test-temp"
+              temp_root.mkdir()
+              env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", TMPDIR=str(temp_root))
+              result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+                                      cwd=app, env=env, capture_output=True, text=True, timeout=120)
+              print(result.stdout)
+              print(result.stderr)
+              if result.returncode != 0:
+                  raise RuntimeError("Fresh-extraction tests failed")
+              count = re.search(r"Ran (\d+) tests?", result.stderr)
+              skipped = re.search(r"OK \(skipped=(\d+)\)", result.stderr)
+              if count is None:
+                  raise RuntimeError("Test count unavailable")
+              ran = int(count.group(1))
+              skipped_count = int(skipped.group(1)) if skipped else 0
+          digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          archive_path.with_suffix(".zip.sha256.txt").write_text(
+              digest + "  " + archive_path.name + "\n", encoding="utf-8")
+          upstream = {key: value["result"] for key, value in json.loads(os.environ["UPSTREAM_RESULTS"]).items()}
+          receipt = {
+              "product": "Large Text Chunker", "version": version,
+              "source_commit": head, "source_tree": tree,
+              "archive": archive_path.name, "archive_sha256": digest,
+              "file_count": len(payload), "zip_crc": "PASS",
+              "upstream_checks": upstream,
+              "qualification": "CI checks passed" if upstream and all(v == "success" for v in upstream.values()) else "UNQUALIFIED CANDIDATE; upstream checks did not all pass",
+              "fresh_extraction_bytes": "PASS",
+              "fresh_extraction_tests": {"ran": ran, "passed": ran - skipped_count,
+                                         "skipped": skipped_count, "failed": 0},
+              "method": "Tracked source only; no credentials, environment dump, or generated user data included.",
+              "limits": ["Not physical Windows or Norton acceptance", "Optional integration may skip here; separate CI jobs run it", "Artifact availability is not release approval"],
+              "files": [{"path": n, "git_blob": b, "bytes": len(d), "sha256": hashlib.sha256(d).hexdigest()}
+                        for n, _, d, b in sorted(payload)],
+              "copyright": "Copyright © 2026 Gateway Information Group LLC. All rights reserved."
+          }
+          (artifacts / "SOURCE_RECEIPT.json").write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+          subprocess.run(["git", "diff", "--exit-code"], check=True, cwd=root)
+      - name: Preserve source and verification receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: large-text-chunker-source-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
 
 # Copyright © 2026 Gateway Information Group LLC. All rights reserved.

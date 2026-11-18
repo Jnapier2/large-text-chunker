@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.11.1 — 2026-09-09
+
+- Pending reconciliation: reuse byte-exact overlap fixtures across platforms and reject overflow-produced non-finite JSON numbers, including nested extension values. Finite extension numbers remain compatible.
+
+- Require a byte-order mark for generic UTF-16/32 instead of silently using native byte order. Endian-specific selections remain supported.
+- Verify actual overlap text and source line ranges; new bundles use inclusive character-based lines and old public bundles keep their legacy convention.
+- Reject duplicate JSON fields, non-finite values, excessive nesting, missing current token metadata, and contradictory estimate/exact claims. Bound manifest reads and limit chunk reads to declared/observed size.
+- Mark interrupted or failed bundles incomplete. Verification refuses them; partial evidence and original source files remain intact.
+- Use exclusive random same-directory temporary files with failure cleanup, bounded collision retries, and rejection of linked output destinations. Reject nonregular inputs before reading.
+- Add 25 regression methods to the existing test suite, including seeded Unicode round trips and injected write/verification failures.
+- Extend CI with a tracked-source ZIP, checksum, per-file receipt, and fresh-extraction tests after the existing Windows/Ubuntu checks. The artifact-upload action is pinned; runtime dependencies and permissions remain unchanged.
+- Retain one runtime module, the established CLI and output placement, the optional tokenizer pin, and existing license/history files. No full-package, runtime-diagnostics, physical-device, or Norton qualification is inherited.
+
+Version 1.11.0 was published through PR #10 while this deeper review was in progress. This patch preserves that release history and corrects additional independently reproduced defects.
+
 ## 1.11.0 — 2026-09-09
 
 - Selectively adapted BOM-aware UTF-8/16/32 input decoding from the 1.19.1 source lineage into the existing compact public runtime.

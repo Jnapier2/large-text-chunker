@@ -15,12 +15,13 @@ import math
 import os
 import re
 import stat
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 # Input decoding is separate from the optional token-counting encoding.
 INPUT_ENCODINGS = (
     "auto", "utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be",
@@ -38,6 +39,10 @@ CHATGPT_TEXT_TOKEN_CAP = 2_000_000
 MIN_MAX_CHARS = 1_000
 MANIFEST_SCHEMA = "large-text-chunker-manifest-v1"
 MAX_MANIFEST_BYTES = 2_000_000
+MAX_OUTPUT_COLLISIONS = 1000
+INCOMPLETE_MARKER = ".incomplete"
+LINE_NUMBERING = "inclusive-character-lines-v2"
+LEGACY_LINE_VERSIONS = {"1.0.0", "1.10.0", "1.11.0"}
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 WINDOWS_FORBIDDEN_FILENAME_CHARACTERS = frozenset('<>:"/\\|?*')
 WINDOWS_RESERVED_BASENAMES = frozenset(
@@ -75,7 +80,7 @@ def sha256_text(value: str) -> str:
 
 
 def estimated_tokens(value: str) -> int:
-    """Return a deliberately conservative, dependency-free token estimate."""
+    """Return a dependency-free estimate, not a guaranteed token upper bound."""
     return math.ceil(len(value.encode("utf-8")) / 3)
 
 
@@ -126,7 +131,7 @@ class TokenCounter:
                     f"{guidance} Install it explicitly with "
                     f"'python -m pip install tiktoken=={OPTIONAL_TIKTOKEN_VERSION}' and retry."
                 ) from None
-            self.warning = f"{guidance} Using the conservative offline estimate instead."
+            self.warning = f"{guidance} Using the offline estimate instead."
 
     @property
     def exact(self) -> bool:
@@ -208,6 +213,8 @@ def read_text_file(
     """
     if input_encoding not in INPUT_ENCODINGS:
         raise ValueError("Unsupported input encoding; use a documented encoding name.")
+    if not path.is_file():
+        raise ValueError("Input must be a regular text file")
     raw = path.read_bytes()
     # UTF-32 LE starts with the UTF-16 LE marker: longest markers go first.
     markers = (
@@ -224,6 +231,8 @@ def read_text_file(
                 raise ValueError("Selected input encoding conflicts with the byte-order mark.")
             marked_encoding = encoding
             break
+    if marked_encoding is None and input_encoding in {"utf-16", "utf-32"}:
+        raise ValueError("Unmarked UTF-16/32 requires an explicit little- or big-endian encoding.")
     if marked_encoding is not None or input_encoding != "auto":
         encoding = marked_encoding or input_encoding
         try:
@@ -329,23 +338,65 @@ def build_chunks(text: str, max_chars: int) -> list[tuple[int, int, str]]:
 
 
 def unique_output_dir(base: Path) -> Path:
-    candidate = base
-    counter = 2
-    while candidate.exists():
-        candidate = base.with_name(f"{base.name}_{counter}")
-        counter += 1
-    candidate.mkdir(parents=True, exist_ok=False)
-    return candidate
+    # Preserve source-adjacent/explicit output semantics, but never silently
+    # follow a linked output destination. This is not a hostile-writer sandbox.
+    base = base.absolute()
+    for component in (base, *base.parents):
+        try:
+            info = component.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or _is_reparse_point(info):
+            raise ValueError("Output destination may not contain links or reparse points")
+    for counter in range(1, MAX_OUTPUT_COLLISIONS + 1):
+        candidate = base if counter == 1 else base.with_name(f"{base.name}_{counter}")
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            # Exclusive creation, not a separate existence check, owns the slot.
+            continue
+    raise ValueError("Output naming collision limit reached; choose another destination")
 
 
 def line_number_at(offset: int, newline_offsets: list[int]) -> int:
-    return bisect.bisect_right(newline_offsets, max(0, offset)) + 1
+    # The newline character itself belongs to the line it terminates.
+    return bisect.bisect_left(newline_offsets, max(0, offset)) + 1
 
 
 def atomic_write(path: Path, content: str) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8", newline="\n")
-    temporary.replace(path)
+    # Random exclusive temporary files cannot follow an old predictable .tmp
+    # symlink. Only this invocation's temporary file is removed on failure.
+    descriptor, name = tempfile.mkstemp(prefix=".chunker-", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Manifest contains a duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError("Manifest contains a non-finite JSON value")
+
+
+def _finite_json_float(value: str) -> float:
+    """Reject overflowed numeric literals as well as named JSON constants."""
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError("Manifest contains a non-finite JSON value")
+    return result
 
 
 def _required_int(
@@ -379,6 +430,8 @@ def _validate_token_metadata(manifest: dict[str, Any]) -> tuple[str, str, int] |
     """Validate additive v1.10 token metadata while retaining v1.0 bundle support."""
     tokenizer_value = manifest.get("tokenizer")
     if tokenizer_value is None:
+        if manifest.get("tool_version") != "1.0.0":
+            raise ValueError("Manifest tokenizer metadata is required for this version")
         return None
     if not isinstance(tokenizer_value, dict):
         raise ValueError("Manifest tokenizer must be a JSON object")
@@ -398,6 +451,8 @@ def _validate_token_metadata(manifest: dict[str, Any]) -> tuple[str, str, int] |
         raise ValueError("Manifest tokenizer exact flag does not match its method")
     if requested_mode == "exact" and not exact:
         raise ValueError("Manifest exact token mode may not record an estimated fallback")
+    if requested_mode == "estimate" and exact:
+        raise ValueError("Manifest estimate mode may not claim exact token accounting")
     if tokenizer.get("automatic_install") is not False:
         raise ValueError("Manifest tokenizer must explicitly disable automatic installation")
     for field in ("package", "package_version", "warning", "fallback_reason"):
@@ -546,8 +601,12 @@ def write_bundle(
     upload_advisory = chatgpt_upload_advisory(
         len(raw_bytes), source_token_count, token_counter
     )
-    base = output.resolve() if output else source.parent / f"{source.stem}_chunks"
+    base = output.absolute() if output else source.parent / f"{source.stem}_chunks"
     output_dir = unique_output_dir(base)
+    # Failed/interrupted writes remain visible but cannot be mistaken for a
+    # verified bundle. Never recursively clean a folder that may contain user data.
+    marker = output_dir / INCOMPLETE_MARKER
+    atomic_write(marker, "Incomplete bundle: creation or verification did not finish.\n")
     newline_offsets = [match.start() for match in re.finditer("\n", text)]
 
     records: list[ChunkRecord] = []
@@ -588,6 +647,7 @@ def write_bundle(
         "source_bytes_sha256": sha256_bytes(raw_bytes),
         "normalized_text_sha256": sha256_text(text),
         "normalized_newlines": True,
+        "line_numbering": LINE_NUMBERING,
         "source_token_count": source_token_count,
         "tokenizer": token_counter.snapshot(),
         "chatgpt_upload_advisory": upload_advisory,
@@ -630,18 +690,36 @@ def write_bundle(
         ]
     )
     atomic_write(output_dir / "index.md", "\n".join(index))
-    verify_bundle(output_dir)
+    _verify_bundle_contents(output_dir)
+    marker.unlink()
     return output_dir
 
 
 def verify_bundle(bundle: Path) -> str:
+    """Verify a completed bundle without loading the optional tokenizer."""
+    if os.path.lexists(bundle / INCOMPLETE_MARKER):
+        raise ValueError("Incomplete bundle: recreate it from the preserved source")
+    return _verify_bundle_contents(bundle)
+
+
+def _verify_bundle_contents(bundle: Path) -> str:
     bundle = bundle.resolve(strict=True)
     if not bundle.is_dir():
         raise ValueError("Bundle path is not a directory")
     manifest_path = _checked_regular_file(bundle, "manifest.json", label="Manifest")
-    if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
+    with manifest_path.open("rb") as handle:
+        manifest_bytes = handle.read(MAX_MANIFEST_BYTES + 1)
+    if len(manifest_bytes) > MAX_MANIFEST_BYTES:
         raise ValueError(f"Manifest exceeds the {MAX_MANIFEST_BYTES}-byte safety limit")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(
+            manifest_bytes.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_finite_json_float,
+        )
+    except (UnicodeError, RecursionError, json.JSONDecodeError):
+        raise ValueError("Manifest is not a supported UTF-8 JSON document") from None
     if not isinstance(manifest, dict):
         raise ValueError("Manifest root must be a JSON object")
     if manifest.get("schema") != MANIFEST_SCHEMA:
@@ -656,6 +734,10 @@ def verify_bundle(bundle: Path) -> str:
     _required_sha256(manifest, "source_bytes_sha256", label="Manifest")
     normalized_text_sha256 = _required_sha256(manifest, "normalized_text_sha256", label="Manifest")
     token_metadata = _validate_token_metadata(manifest)
+    line_numbering = manifest.get("line_numbering")
+    legacy_lines = line_numbering is None and manifest["tool_version"] in LEGACY_LINE_VERSIONS
+    if not legacy_lines and line_numbering != LINE_NUMBERING:
+        raise ValueError("Unsupported or missing line-numbering convention")
     max_characters = _required_int(
         manifest,
         "max_characters_per_raw_chunk",
@@ -734,7 +816,7 @@ def verify_bundle(bundle: Path) -> str:
 
         chunk_path = _checked_regular_file(bundle, filename, label=f"Record {index} chunk")
         with chunk_path.open("r", encoding="utf-8", newline="") as handle:
-            content = handle.read()
+            content = handle.read(min(output_characters, os.fstat(handle.fileno()).st_size) + 1)
         if sha256_text(content) != output_sha256:
             raise ValueError(f"Output hash mismatch: {filename}")
         if len(content) != output_characters:
@@ -755,10 +837,25 @@ def verify_bundle(bundle: Path) -> str:
             raise ValueError(f"Raw character count mismatch: {filename}")
         if sha256_text(raw_content) != raw_sha256:
             raise ValueError(f"Raw content hash mismatch: {filename}")
+        previous_raw = reconstructed[-1] if reconstructed else ""
+        expected_prefix = previous_raw[-requested_overlap:] if requested_overlap else ""
+        if prefix_length != len(expected_prefix) or content[:prefix_length] != expected_prefix:
+            raise ValueError(f"Overlap context mismatch: {filename}")
         reconstructed.append(raw_content)
         expected_raw_start = raw_end
 
     reconstructed_text = "".join(reconstructed)
+    newline_offsets = [match.start() for match in re.finditer("\n", reconstructed_text)]
+    for record in records:
+        if legacy_lines:
+            # Old public bundles used the following-line convention at a newline.
+            start = bisect.bisect_right(newline_offsets, record["raw_start"]) + 1
+            end = bisect.bisect_right(newline_offsets, record["raw_end"] - 1) + 1
+        else:
+            start = line_number_at(record["raw_start"], newline_offsets)
+            end = line_number_at(record["raw_end"] - 1, newline_offsets)
+        if (record["start_line"], record["end_line"]) != (start, end):
+            raise ValueError("Source line range does not match reconstructed content")
     reconstructed_hash = sha256_text(reconstructed_text)
     if reconstructed_hash != normalized_text_sha256:
         raise ValueError("Reconstructed source hash does not match the manifest")
