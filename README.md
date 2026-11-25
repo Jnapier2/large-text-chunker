@@ -10,17 +10,29 @@ The distinctive design choice is to check the relationships between the pieces, 
 
 ## Public source 1.11.1
 
+[Download the verified source ZIP and checksum](https://github.com/Jnapier2/large-text-chunker/releases/tag/v1.11.1).
+
 This update supports Unicode text exports with UTF-8, UTF-16, and UTF-32 byte-order marks, adds explicit encoding selection, and strengthens bundle verification and failure handling. The standard-library default runs locally without an account, credentials, or network requests.
 
 ## Quick start
 
 Requires Python 3.10 or newer.
 
+From the extracted source folder, split a text file and verify its bundle.
+
 ```powershell
 python src/large_text_chunker.py split "notes.txt"
-python src/large_text_chunker.py split "notes.txt" --max-chars 12000 --overlap 600
 python src/large_text_chunker.py verify "notes_chunks"
 ```
+
+To try a custom segment size and overlap, give that run its own output folder.
+
+```powershell
+python src/large_text_chunker.py split "notes.txt" --max-chars 12000 --overlap 600 --output "notes_custom_chunks"
+python src/large_text_chunker.py verify "notes_custom_chunks"
+```
+
+If an output folder already exists, verify the directory that `split` prints.
 
 The default output is beside the selected source file, not in the caller's working directory. `--output` selects another destination. Existing outputs are preserved with a numeric suffix; output paths containing links or reparse points are rejected. Each finished bundle contains numbered text files, `index.md`, and `manifest.json`.
 
